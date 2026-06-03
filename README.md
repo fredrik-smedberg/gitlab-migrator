@@ -40,17 +40,25 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -github-user string
         specifies the GitHub user to use, who will author any migrated PRs (required)
   -gitlab-domain string
-        specifies the GitLab domain to use (default "gitlab.com")
+        specifies the GitLab domain to use (may include a port, e.g. gitlab.example.com:8080) (default "gitlab.com")
+  -gitlab-insecure
+        when true, skip TLS certificate verification when connecting to the GitLab API
   -gitlab-project string
         the GitLab project to migrate
+  -gitlab-scheme string
+        specifies the scheme (https or http) to use for the GitLab API (default "https")
   -loop
         continue migrating until canceled
   -max-concurrency int
         how many projects to migrate in parallel (default 4)
   -merge-requests-max-age string
         optional maximum age in days of merge requests to migrate
+  -migrate-closed-merge-requests
+        when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated (default true)
   -migrate-pull-requests
         whether pull requests should be migrated
+  -no-prompt
+        skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs
   -projects-csv string
         specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)
   -rename-master-to-main
@@ -73,7 +81,11 @@ For authentication, the `GITLAB_TOKEN` and `GITHUB_TOKEN` environment variables 
 
 Use the `-github-user` argument to specify the GitHub username for whom the authentication token was issued (mandatory). You can also specify this with the `GITHUB_USER` environment variable.
 
-Specify the location of a self-hosted instance of GitLab with the `-gitlab-domain` argument, or a GitHub Enterprise instance with the `-github-domain` argument.
+Specify the location of a self-hosted instance of GitLab with the `-gitlab-domain` argument, or a GitHub Enterprise instance with the `-github-domain` argument. The `-gitlab-domain` value may include a port number (for example `gitlab.example.com:8080`).
+
+If your GitLab instance does not serve HTTPS, set `-gitlab-scheme http`. If it uses HTTPS with a self-signed or otherwise untrusted certificate, set `-gitlab-insecure` to skip TLS certificate verification.
+
+Both `-gitlab-scheme http` and `-gitlab-insecure` weaken the security of the connection to GitLab, so the tool prints a warning and asks you to confirm before continuing. Because your token may be exposed in these modes, you should use a temporary token that is not used for anything else, and delete or rotate it immediately after the migration completes. For non-interactive/automated runs, pass `-no-prompt` to skip the confirmation prompt (the warnings are still printed and the tool continues immediately).
 
 ## Specify repositories
 
@@ -103,6 +115,10 @@ As a bonus, if your GitLab users add the URL to their GitHub profile in the `Web
 This tool also migrates merged/closed merge requests from your GitLab projects. It does this by reconstructing temporary branches in each repo, pushing them to GitHub, creating then closing the pull request, and lastly deleting the temporary branches. Once the tool has completed, you should not have any of these temporary branches in your repo - although GitHub will not garbage collect them immediately such that you can click the `Restore branch` button in any of these PRs.
 
 If you have a large number of merge requests, or projects with a long history spanning many GitLab upgrades, you may wish to specify the `-skip-invalid-merge-requests` argument. This will cause the tool to emit INFO messages for merge requests that it considers invalid, such as those that are still marked as Open but have no source/head branch, or where there is no diff for a closed merge request. Without this option, an error will be logged instead.
+
+By default, both merged merge requests and those that were closed without merging are migrated. If you only want to migrate merged (and open) merge requests, set `-migrate-closed-merge-requests=false` to exclude merge requests that were closed without merging.
+
+The title of each migrated pull request is prefixed to reflect the original state of the merge request on GitLab: `MERGED: ` for merged merge requests and `CLOSED: ` for those closed without merging. In addition, a final comment is added to each migrated pull request describing how the merge request was ultimately resolved on GitLab — whether it was merged or closed without merging, by whom, and when.
 
 Similarly, you can specify a maximum age for merge requests to migrate with the `-merge-requests-max-age` argument, which is useful for 'topping off' projects that are already migrated.
 

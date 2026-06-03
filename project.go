@@ -99,7 +99,7 @@ func (p *project) migrate(ctx context.Context) error {
 		return fmt.Errorf("retrieving github repo: %v", err)
 	}
 
-	homepage := fmt.Sprintf("https://%s/%s/%s", gitlabDomain, p.gitlabPath[0], p.gitlabPath[1])
+	homepage := fmt.Sprintf("%s://%s/%s/%s", gitlabScheme, gitlabDomain, p.gitlabPath[0], p.gitlabPath[1])
 
 	if err != nil {
 		// Repository not found
@@ -309,6 +309,11 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 			continue
 		}
 
+		if !migrateClosedMergeRequests && strings.EqualFold(mergeRequest.State, "closed") {
+			logger.Debug("skipping closed merge request as -migrate-closed-merge-requests is disabled", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
+			continue
+		}
+
 		if ok, err := p.migrateMergeRequest(ctx, mergeRequest); err != nil {
 			sendErr(err)
 			failureCount++
@@ -320,6 +325,105 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 	skippedCount := totalCount - successCount - failureCount
 
 	logger.Info("migrated merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "successful", successCount, "failed", failureCount, "skipped", skippedCount)
+}
+
+// fetchCommitsBySHA ensures the given commit SHAs are present in the local
+// repository, fetching any that are missing directly from the GitLab remote by
+// SHA. This recovers commits that are no longer reachable from any advertised
+// branch or tag (for example, the commits of a closed or merged merge request
+// whose source branch has since been deleted). Commits that are already present
+// are skipped. The GitLab server must permit fetching by SHA, which it does via
+// the AllowReachableSHA1InWant/AllowTipSHA1InWant capabilities.
+func (p *project) fetchCommitsBySHA(ctx context.Context, shas []string) error {
+	refSpecs := make([]config.RefSpec, 0, len(shas))
+	seen := make(map[string]bool)
+	for _, sha := range shas {
+		if sha == "" || seen[sha] {
+			continue
+		}
+		seen[sha] = true
+
+		// Skip commits that are already present locally to avoid unnecessary fetches
+		if _, err := object.GetCommit(p.repo.Storer, plumbing.NewHash(sha)); err == nil {
+			continue
+		}
+
+		// Map the commit into a local ref so the objects are retained after fetching
+		refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%s:refs/migration/commits/%s", sha, sha)))
+	}
+
+	if len(refSpecs) == 0 {
+		return nil
+	}
+
+	if err := p.repo.FetchContext(ctx, &git.FetchOptions{
+		RemoteName: "gitlab",
+		RefSpecs:   refSpecs,
+		Force:      true,
+		Tags:       git.NoTags,
+	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return err
+	}
+
+	return nil
+}
+
+// finalCommentMarker uniquely identifies the comment describing what
+// ultimately happened to the merge request on GitLab, allowing the comment to
+// be updated idempotently rather than duplicated on subsequent migrations.
+const finalCommentMarker = "This pull request reflects the final state of the merge request on GitLab"
+
+// mergeRequestFinalComment builds a note-style comment describing how the
+// merge request was finally resolved on GitLab (merged or closed without
+// merging), including who performed the action and when. It returns an empty
+// string for merge requests that are still open.
+func (p *project) mergeRequestFinalComment(mergeRequest *gitlab.MergeRequest) (string, error) {
+	resolveActor := func(user *gitlab.BasicUser) (string, error) {
+		if user == nil {
+			return "_Unknown_", nil
+		}
+
+		name := user.Name
+		gitlabUser, err := getGitlabUser(user.Username)
+		if err != nil {
+			return "", fmt.Errorf("retrieving gitlab user: %v", err)
+		}
+		if gitlabUser.WebsiteURL != "" {
+			name = "@" + strings.TrimPrefix(strings.ToLower(gitlabUser.WebsiteURL), "https://github.com/")
+		}
+		return name, nil
+	}
+
+	var summary string
+	switch {
+	case strings.EqualFold(mergeRequest.State, "merged"):
+		actor, err := resolveActor(mergeRequest.MergedBy)
+		if err != nil {
+			return "", err
+		}
+		when := "an unknown date"
+		if mergeRequest.MergedAt != nil {
+			when = mergeRequest.MergedAt.UTC().Format(dateTimeFormat)
+		}
+		summary = fmt.Sprintf("This merge request was **merged** by %s on %s.", actor, when)
+	case strings.EqualFold(mergeRequest.State, "closed"):
+		actor, err := resolveActor(mergeRequest.ClosedBy)
+		if err != nil {
+			return "", err
+		}
+		when := "an unknown date"
+		if mergeRequest.ClosedAt != nil {
+			when = mergeRequest.ClosedAt.UTC().Format(dateTimeFormat)
+		}
+		summary = fmt.Sprintf("This merge request was **closed without merging** by %s on %s.", actor, when)
+	default:
+		return "", nil
+	}
+
+	return fmt.Sprintf(`> [!NOTE]
+> %s
+>
+> %s`, finalCommentMarker, summary), nil
 }
 
 func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.MergeRequest) (bool, error) {
@@ -423,6 +527,22 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 		if mergeRequestCommits[len(mergeRequestCommits)-1] == nil {
 			return false, fmt.Errorf("end commit for merge request %d is nil", mergeRequest.IID)
+		}
+
+		// A mirror clone only retrieves objects reachable from advertised branches
+		// and tags. When a merge request is closed or merged its source branch is
+		// frequently deleted, leaving the merge request's commits unreachable, so they
+		// are never downloaded and lookups below fail with "object not found". GitLab
+		// allows fetching these commits directly by SHA (AllowReachableSHA1InWant), so
+		// we fetch any of the merge request's commits that aren't already present.
+		commitShas := make([]string, 0, len(mergeRequestCommits))
+		for _, commit := range mergeRequestCommits {
+			if commit != nil {
+				commitShas = append(commitShas, commit.ID)
+			}
+		}
+		if err = p.fetchCommitsBySHA(ctx, commitShas); err != nil {
+			return false, fmt.Errorf("fetching merge request commits by SHA: %v", err)
 		}
 
 		logger.Trace("inspecting start commit", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "sha", mergeRequestCommits[0].ShortID)
@@ -573,14 +693,23 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 	closeDate := ""
 	if mergeRequest.State == "closed" && mergeRequest.ClosedAt != nil {
-		closeDate = fmt.Sprintf("\n> | **Date Originally Closed** | %s |", mergeRequest.ClosedAt.Format(dateFormat))
+		closeDate = fmt.Sprintf("\n> | **Date Originally Closed** | %s |", mergeRequest.ClosedAt.UTC().Format(dateTimeFormat))
 	} else if mergeRequest.State == "merged" && mergeRequest.MergedAt != nil {
-		closeDate = fmt.Sprintf("\n> | **Date Originally Merged** | %s |", mergeRequest.MergedAt.Format(dateFormat))
+		closeDate = fmt.Sprintf("\n> | **Date Originally Merged** | %s |", mergeRequest.MergedAt.UTC().Format(dateTimeFormat))
 	}
 
 	mergeRequestTitle := mergeRequest.Title
 	if len(mergeRequestTitle) > 40 {
 		mergeRequestTitle = mergeRequestTitle[:40] + "..."
+	}
+
+	// Prefix the pull request title to reflect the original GitLab merge request state
+	pullRequestTitle := mergeRequest.Title
+	switch {
+	case strings.EqualFold(mergeRequest.State, "merged"):
+		pullRequestTitle = "MERGED: " + pullRequestTitle
+	case strings.EqualFold(mergeRequest.State, "closed"):
+		pullRequestTitle = "CLOSED: " + pullRequestTitle
 	}
 
 	body := fmt.Sprintf(`> [!NOTE]
@@ -589,9 +718,9 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
-> | **GitLab Project** | [%[4]s/%[5]s](https://%[10]s/%[4]s/%[5]s) |
-> | **GitLab Merge Request** | [%[11]s](https://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
-> | **GitLab MR Number** | [%[2]d](https://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
+> | **GitLab Project** | [%[4]s/%[5]s](%[12]s://%[10]s/%[4]s/%[5]s) |
+> | **GitLab Merge Request** | [%[11]s](%[12]s://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
+> | **GitLab MR Number** | [%[2]d](%[12]s://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
 > | **Date Originally Opened** | %[6]s |%[7]s
 > | **Approved on GitLab by** | %[8]s |
 > |      |      |
@@ -600,12 +729,12 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 ## Original Description
 
-%[3]s`, githubAuthorName, mergeRequest.IID, description, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.CreatedAt.Format(dateFormat), closeDate, approval, originalState, gitlabDomain, mergeRequestTitle)
+%[3]s`, githubAuthorName, mergeRequest.IID, description, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.CreatedAt.UTC().Format(dateTimeFormat), closeDate, approval, originalState, gitlabDomain, mergeRequestTitle, gitlabScheme)
 
 	if pullRequest == nil {
 		logger.Info("creating pull request", "owner", p.githubPath[0], "repo", p.githubPath[1], "source_branch", mergeRequest.SourceBranch, "target_branch", mergeRequest.TargetBranch)
 		newPullRequest := github.NewPullRequest{
-			Title:               &mergeRequest.Title,
+			Title:               &pullRequestTitle,
 			Head:                &mergeRequest.SourceBranch,
 			Base:                &mergeRequest.TargetBranch,
 			Body:                &body,
@@ -650,12 +779,12 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 
 		if (newState != nil && (pullRequest.State == nil || *pullRequest.State != *newState)) ||
-			(pullRequest.Title == nil || *pullRequest.Title != mergeRequest.Title) ||
+			(pullRequest.Title == nil || *pullRequest.Title != pullRequestTitle) ||
 			(pullRequest.Body == nil || *pullRequest.Body != body) ||
 			(pullRequest.Draft == nil || *pullRequest.Draft != mergeRequest.Draft) {
 			logger.Info("updating pull request", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 
-			pullRequest.Title = &mergeRequest.Title
+			pullRequest.Title = &pullRequestTitle
 			pullRequest.Body = &body
 			pullRequest.Draft = &mergeRequest.Draft
 			pullRequest.MaintainerCanModify = nil
@@ -724,7 +853,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 ## Original Comment
 
-%[4]s`, githubCommentAuthorName, comment.ID, comment.CreatedAt.Format("Mon, 2 Jan 2006"), comment.Body)
+%[4]s`, githubCommentAuthorName, comment.ID, comment.CreatedAt.UTC().Format(dateTimeFormat), comment.Body)
 
 			foundExistingComment := false
 			for _, prComment := range prComments {
@@ -754,6 +883,41 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 				}
 				if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
 					return false, fmt.Errorf("creating pull request comment: %v", err)
+				}
+			}
+		}
+
+		// Add a final comment describing what ultimately happened to the merge request on GitLab
+		if finalBody, err := p.mergeRequestFinalComment(mergeRequest); err != nil {
+			return false, err
+		} else if finalBody != "" {
+			foundExistingFinal := false
+			for _, prComment := range prComments {
+				if prComment == nil {
+					continue
+				}
+
+				if strings.Contains(prComment.GetBody(), finalCommentMarker) {
+					foundExistingFinal = true
+
+					if prComment.Body == nil || *prComment.Body != finalBody {
+						logger.Debug("updating merge request final comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+						prComment.Body = &finalBody
+						if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
+							return false, fmt.Errorf("updating merge request final comment: %v", err)
+						}
+					}
+					break
+				}
+			}
+
+			if !foundExistingFinal {
+				logger.Debug("creating merge request final comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
+				newComment := github.IssueComment{
+					Body: &finalBody,
+				}
+				if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
+					return false, fmt.Errorf("creating merge request final comment: %v", err)
 				}
 			}
 		}
