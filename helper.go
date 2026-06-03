@@ -1,18 +1,43 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/google/go-github/v74/github"
 	"github.com/xanzy/go-gitlab"
 )
+
+// confirmContinue prints the supplied warning and, unless -no-prompt is set,
+// prompts the user to confirm whether they want to continue. It returns true
+// if execution should proceed. When -no-prompt is set the warning is still
+// printed and execution continues immediately.
+func confirmContinue(warning string) bool {
+	fmt.Fprintln(os.Stderr, warning)
+
+	if noPrompt {
+		return true
+	}
+
+	fmt.Fprint(os.Stderr, "Do you want to continue? [y/N]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+
+	response = strings.ToLower(strings.TrimSpace(response))
+	return response == "y" || response == "yes"
+}
 
 func getGithubBranches(ctx context.Context, owner, repo string) ([]*github.Branch, error) {
 	var err error

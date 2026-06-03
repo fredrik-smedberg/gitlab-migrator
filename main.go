@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,13 +27,15 @@ import (
 
 const (
 	dateFormat          = "Mon, 2 Jan 2006"
+	dateTimeFormat      = "Mon, 2 Jan 2006 15:04:05 MST"
 	defaultGithubDomain = "github.com"
 	defaultGitlabDomain = "gitlab.com"
+	defaultGitlabScheme = "https"
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
-var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
+var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
+var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabScheme, gitlabToken, projectsCsvPath, renameTrunkBranch string
 var mergeRequestsAge int
 
 var (
@@ -96,6 +100,9 @@ func main() {
 
 	flag.BoolVar(&deleteExistingRepos, "delete-existing-repos", false, "whether existing repositories should be deleted before migrating")
 	flag.BoolVar(&enablePullRequests, "migrate-pull-requests", false, "whether pull requests should be migrated")
+	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to the GitLab API")
+	flag.BoolVar(&migrateClosedMergeRequests, "migrate-closed-merge-requests", true, "when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated")
+	flag.BoolVar(&noPrompt, "no-prompt", false, "skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs")
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
@@ -104,7 +111,8 @@ func main() {
 	flag.StringVar(&githubDomain, "github-domain", defaultGithubDomain, "specifies the GitHub domain to use")
 	flag.StringVar(&githubRepo, "github-repo", "", "the GitHub repository to migrate to")
 	flag.StringVar(&githubUser, "github-user", "", "specifies the GitHub user to use, who will author any migrated PRs (required)")
-	flag.StringVar(&gitlabDomain, "gitlab-domain", defaultGitlabDomain, "specifies the GitLab domain to use")
+	flag.StringVar(&gitlabDomain, "gitlab-domain", defaultGitlabDomain, "specifies the GitLab domain to use (may include a port, e.g. gitlab.example.com:8080)")
+	flag.StringVar(&gitlabScheme, "gitlab-scheme", defaultGitlabScheme, "specifies the scheme (https or http) to use for the GitLab API")
 	flag.StringVar(&gitlabProject, "gitlab-project", "", "the GitLab project to migrate")
 	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)")
 	flag.StringVar(&mergeRequestsAgeRaw, "merge-requests-max-age", "", "optional maximum age in days of merge requests to migrate")
@@ -137,6 +145,40 @@ func main() {
 	if githubUser == "" {
 		logger.Error("must specify GitHub user")
 		os.Exit(1)
+	}
+
+	if gitlabScheme != "https" && gitlabScheme != "http" {
+		logger.Error("invalid -gitlab-scheme, must be either https or http", "scheme", gitlabScheme)
+		os.Exit(1)
+	}
+
+	if gitlabScheme == "http" {
+		warning := strings.Join([]string{
+			"",
+			"WARNING: -gitlab-scheme is set to 'http'.",
+			"Your GitLab token and all API traffic will be sent UNENCRYPTED and could be intercepted.",
+			"You should use a temporary token that is not used for anything else, and delete or rotate",
+			"that token immediately after this command completes.",
+			"",
+		}, "\n")
+		if !confirmContinue(warning) {
+			os.Exit(1)
+		}
+	}
+
+	if gitlabInsecure {
+		warning := strings.Join([]string{
+			"",
+			"WARNING: -gitlab-insecure is set, disabling TLS certificate verification.",
+			"The identity of the GitLab server will not be verified, so the connection (and your token)",
+			"could be compromised by a man-in-the-middle attacker.",
+			"You should use a temporary token that is not used for anything else, and delete or rotate",
+			"that token immediately after this command completes.",
+			"",
+		}, "\n")
+		if !confirmContinue(warning) {
+			os.Exit(1)
+		}
 	}
 
 	repoSpecifiedInline := githubRepo != "" && gitlabProject != ""
@@ -304,8 +346,15 @@ func main() {
 	}
 
 	gitlabOpts := make([]gitlab.ClientOptionFunc, 0)
-	if gitlabDomain != defaultGitlabDomain {
-		gitlabUrl := fmt.Sprintf("https://%s", gitlabDomain)
+	if gitlabInsecure {
+		insecureClient := cleanhttp.DefaultPooledClient()
+		if insecureTransport, ok := insecureClient.Transport.(*http.Transport); ok {
+			insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		gitlabOpts = append(gitlabOpts, gitlab.WithHTTPClient(insecureClient))
+	}
+	if gitlabScheme != defaultGitlabScheme || gitlabDomain != defaultGitlabDomain {
+		gitlabUrl := fmt.Sprintf("%s://%s", gitlabScheme, gitlabDomain)
 		gitlabOpts = append(gitlabOpts, gitlab.WithBaseURL(gitlabUrl))
 	}
 	if gl, err = gitlab.NewClient(gitlabToken, gitlabOpts...); err != nil {
