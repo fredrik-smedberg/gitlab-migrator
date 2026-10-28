@@ -195,9 +195,10 @@ func (p *project) migrate(ctx context.Context) (err error) {
 	}
 	p.bar.setPhase("cloning", 0)
 	if err = p.repo.FetchContext(ctx, &git.FetchOptions{
-		RemoteName: "gitlab",
-		Tags:       git.NoTags,
-		CABundle:   gitlabCABundle,
+		RemoteName:      "gitlab",
+		Tags:            git.NoTags,
+		CABundle:        gitlabCABundle,
+		InsecureSkipTLS: gitlabInsecure,
 	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return fmt.Errorf("cloning gitlab repo: %v", err)
 	}
@@ -559,11 +560,12 @@ func (p *project) fetchMissingCommits(ctx context.Context, shas []string) error 
 	}()
 
 	if err := p.repo.FetchContext(ctx, &git.FetchOptions{
-		RemoteName: "gitlab",
-		RefSpecs:   refSpecs,
-		Force:      true,
-		Tags:       git.NoTags,
-		CABundle:   gitlabCABundle,
+		RemoteName:      "gitlab",
+		RefSpecs:        refSpecs,
+		Force:           true,
+		Tags:            git.NoTags,
+		CABundle:        gitlabCABundle,
+		InsecureSkipTLS: gitlabInsecure,
 	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return err
 	}

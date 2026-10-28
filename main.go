@@ -115,7 +115,7 @@ func main() {
 
 	flag.BoolVar(&deleteExistingRepos, "delete-existing-repos", false, "whether existing repositories should be deleted before migrating")
 	flag.BoolVar(&enablePullRequests, "migrate-pull-requests", false, "whether pull requests should be migrated")
-	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to the GitLab API")
+	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to GitLab (API and git); prefer -gitlab-ca-file")
 	flag.StringVar(&gitlabCAFile, "gitlab-ca-file", "", "path to a PEM file with additional CA certificates to trust for the GitLab server")
 	flag.BoolVar(&migrateClosedMergeRequests, "migrate-closed-merge-requests", true, "when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated")
 	flag.BoolVar(&noProgress, "no-progress", false, "disable the live progress bars (they are also disabled when stderr is not a terminal)")
