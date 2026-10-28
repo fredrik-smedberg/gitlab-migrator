@@ -212,8 +212,14 @@ func main() {
 		}
 	}
 
+	// The throttle sits below the retry client, so every attempt, retries included, passes it: it sees
+	// every 403/429 response and sets the shared pause, and each retried attempt waits for that pause
+	// and for the write limiter.
+	pooled := cleanhttp.DefaultPooledClient()
+	pooled.Transport = newThrottlingTransport(pooled.Transport, githubWritesPerHour)
+
 	retryClient := &retryablehttp.Client{
-		HTTPClient:   cleanhttp.DefaultPooledClient(),
+		HTTPClient:   pooled,
 		Logger:       nil,
 		RetryMax:     8,
 		RetryWaitMin: 5 * time.Second,
@@ -348,9 +354,7 @@ func main() {
 		return false, nil
 	}
 
-	// The throttle wraps the retrying transport, so all retry attempts of one request happen inside
-	// a single throttled call, and a pause set from a 403/429 applies to all later calls.
-	transport := newThrottlingTransport(&retryablehttp.RoundTripper{Client: retryClient}, githubWritesPerHour)
+	transport := &retryablehttp.RoundTripper{Client: retryClient}
 	client := githubpagination.NewClient(transport, githubpagination.WithPerPage(100))
 
 	if githubDomain == defaultGithubDomain {
