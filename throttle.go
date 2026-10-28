@@ -9,12 +9,15 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// throttlingTransport is the outermost RoundTripper for the GitHub REST client. It is shared by
-// all goroutines, so it enforces process-wide limits:
+// throttlingTransport is the HTTP transport below the GitHub retry client, so every attempt,
+// retries included, passes through it. It is shared by all goroutines, so it enforces
+// process-wide limits:
 //   - content-creating requests (POST, PATCH, PUT, DELETE) are spaced out by a rate limiter, to
 //     stay within GitHub's secondary rate limits (80 per minute, 500 per hour);
 //   - when GitHub answers 403 or 429 with a Retry-After header, all later requests, reads included,
 //     wait until that time has passed, since continuing to send requests while rate-limited risks a ban.
+//
+// The "github write" Debug line is logged per attempt, which is also what GitHub's rate limit counts.
 //
 // Only REST API calls go through this transport. Git pushes use go-git's own HTTP transport and are
 // not throttled here.
