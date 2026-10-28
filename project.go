@@ -422,11 +422,9 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 	}
 
 	// Registered before pushing so that partially pushed branches are also deleted.
-	// Cleanup must run after Ctrl-C too, so it gets its own deadline instead of ctx's cancellation.
+	// Cleanup must run after Ctrl-C too; deleteTemporaryBranches sets its own deadlines.
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-		defer cancel()
-		if err := p.deleteTemporaryBranches(cleanupCtx); err != nil {
+		if err := p.deleteTemporaryBranches(ctx, ctx.Err() != nil); err != nil {
 			sendErr(fmt.Errorf("deleting temporary branches: %v", err))
 		}
 	}()
