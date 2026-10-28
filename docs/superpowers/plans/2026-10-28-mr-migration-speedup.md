@@ -30,6 +30,7 @@ LOG_LEVEL=TRACE /tmp/gitlab-migrator -gitlab-domain sees-gitlab.sams.internal \
   -gitlab-project connect/scheduling/usermanagementservice \
   -github-repo ssc-sandbox/$TARGET \
   -github-user Fredrik-Smedberg_SSCSpace -migrate-pull-requests -skip-invalid-merge-requests -no-prompt \
+  -gitlab-ca-file $HOME/.config/gitlab-migrator/ssc-ca.pem \
   2>&1 | tee /tmp/migration-run.log
 ```
 
