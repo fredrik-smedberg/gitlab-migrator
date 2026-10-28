@@ -1,8 +1,21 @@
 package main
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/hashicorp/go-hclog"
 )
 
 func TestChunk(t *testing.T) {
@@ -22,5 +35,94 @@ func TestChunk(t *testing.T) {
 	want = [][]string{{"a", "b", "c", "d", "e"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chunk(items, 0) = %v, want %v", got, want)
+	}
+}
+
+// newFetchTestProject returns a project whose "gitlab" remote is a local
+// on-disk repository with one commit, and that commit's hash. go-git serves
+// local remotes with the system git-upload-pack, so the test needs git on PATH.
+func newFetchTestProject(t *testing.T) (*project, plumbing.Hash) {
+	t.Helper()
+
+	if _, err := exec.LookPath("git-upload-pack"); err != nil {
+		t.Skip("git-upload-pack not found on PATH")
+	}
+
+	if logger == nil {
+		logger = hclog.NewNullLogger()
+	}
+
+	dir := t.TempDir()
+	source, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("initializing source repository: %v", err)
+	}
+	// Allow fetching by SHA, as GitLab does
+	cfg, err := source.Config()
+	if err != nil {
+		t.Fatalf("reading source config: %v", err)
+	}
+	cfg.Raw.Section("uploadpack").SetOption("allowAnySHA1InWant", "true")
+	if err = source.SetConfig(cfg); err != nil {
+		t.Fatalf("writing source config: %v", err)
+	}
+
+	worktree, err := source.Worktree()
+	if err != nil {
+		t.Fatalf("opening worktree: %v", err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, "file"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+	if _, err = worktree.Add("file"); err != nil {
+		t.Fatalf("adding file: %v", err)
+	}
+	hash, err := worktree.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Now()},
+	})
+	if err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		t.Fatalf("initializing repository: %v", err)
+	}
+	if _, err = repo.CreateRemote(&config.RemoteConfig{Name: "gitlab", URLs: []string{dir}}); err != nil {
+		t.Fatalf("adding remote: %v", err)
+	}
+
+	return &project{repo: repo, gitlabPath: []string{"group", "name"}}, hash
+}
+
+func TestFetchCommitsBySHAFallsBackToSingleFetches(t *testing.T) {
+	p, hash := newFetchTestProject(t)
+	missingSHA := strings.Repeat("1", 40)
+
+	if err := p.fetchCommitsBySHA(context.Background(), []string{missingSHA, hash.String()}); err != nil {
+		t.Fatalf("fetchCommitsBySHA returned error: %v", err)
+	}
+
+	if _, err := object.GetCommit(p.repo.Storer, hash); err != nil {
+		t.Errorf("commit %s not present after fetch: %v", hash, err)
+	}
+
+	refs, err := p.repo.References()
+	if err != nil {
+		t.Fatalf("listing references: %v", err)
+	}
+	_ = refs.ForEach(func(ref *plumbing.Reference) error {
+		if strings.HasPrefix(ref.Name().String(), "refs/migration/commits/") {
+			t.Errorf("reference %s left after fetch", ref.Name())
+		}
+		return nil
+	})
+}
+
+func TestFetchCommitsBySHASingleMissingReturnsError(t *testing.T) {
+	p, _ := newFetchTestProject(t)
+
+	if err := p.fetchCommitsBySHA(context.Background(), []string{strings.Repeat("1", 40)}); err == nil {
+		t.Error("expected an error when the only commit cannot be fetched")
 	}
 }
