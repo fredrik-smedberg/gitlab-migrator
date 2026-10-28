@@ -419,7 +419,11 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 
 	if err := p.pushTemporaryBranches(ctx, work); err != nil {
 		sendErr(err)
-		failureCount += len(work)
+		for _, w := range work {
+			if w.skip == "" {
+				failureCount++
+			}
+		}
 		return
 	}
 
@@ -445,9 +449,13 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 // whose source branch has since been deleted). Commits that are already present
 // are skipped. The GitLab server must permit fetching by SHA, which it does via
 // the AllowReachableSHA1InWant/AllowTipSHA1InWant capabilities.
+//
+// The missing commits are fetched in one batch. If the batch fails, for example
+// because one commit no longer exists on GitLab, they are fetched one by one
+// and per-commit errors are ignored, so one bad SHA does not prevent fetching
+// the others. Callers must check that the commits they need are present.
 func (p *project) fetchCommitsBySHA(ctx context.Context, shas []string) error {
-	refSpecs := make([]config.RefSpec, 0, len(shas))
-	refs := make([]plumbing.ReferenceName, 0, len(shas))
+	missing := make([]string, 0, len(shas))
 	seen := make(map[string]bool)
 	for _, sha := range shas {
 		if sha == "" || seen[sha] {
@@ -459,14 +467,40 @@ func (p *project) fetchCommitsBySHA(ctx context.Context, shas []string) error {
 		if _, err := object.GetCommit(p.repo.Storer, plumbing.NewHash(sha)); err == nil {
 			continue
 		}
-
-		// Map the commit into a local ref so that go-git accepts the fetch
-		refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%s:refs/migration/commits/%s", sha, sha)))
-		refs = append(refs, plumbing.ReferenceName("refs/migration/commits/"+sha))
+		missing = append(missing, sha)
 	}
 
-	if len(refSpecs) == 0 {
+	if len(missing) == 0 {
 		return nil
+	}
+
+	err := p.fetchMissingCommits(ctx, missing)
+	if err == nil || len(missing) == 1 || ctx.Err() != nil {
+		return err
+	}
+
+	logger.Debug("fetching commits by SHA failed, fetching one by one", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", len(missing), "error", err)
+	for _, sha := range missing {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := p.fetchMissingCommits(ctx, []string{sha}); err != nil {
+			logger.Debug("fetching commit by SHA failed", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", sha, "error", err)
+		}
+	}
+
+	return nil
+}
+
+// fetchMissingCommits fetches the given commit SHAs from the GitLab remote in one fetch.
+func (p *project) fetchMissingCommits(ctx context.Context, shas []string) error {
+	refSpecs := make([]config.RefSpec, 0, len(shas))
+	refs := make([]plumbing.ReferenceName, 0, len(shas))
+	for _, sha := range shas {
+		// Map the commit into a local ref so that go-git accepts the fetch
+		ref := plumbing.ReferenceName("refs/migration/commits/" + sha)
+		refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%s:%s", sha, ref)))
+		refs = append(refs, ref)
 	}
 
 	// Drop the refs again; the objects stay in storage. go-git sends every local
@@ -501,14 +535,14 @@ const finalCommentMarker = "This pull request reflects the final state of the me
 // merge request was finally resolved on GitLab (merged or closed without
 // merging), including who performed the action and when. It returns an empty
 // string for merge requests that are still open.
-func (p *project) mergeRequestFinalComment(mergeRequest *gitlab.MergeRequest) (string, error) {
+func (p *project) mergeRequestFinalComment(ctx context.Context, mergeRequest *gitlab.MergeRequest) (string, error) {
 	resolveActor := func(user *gitlab.BasicUser) (string, error) {
 		if user == nil {
 			return "_Unknown_", nil
 		}
 
 		name := user.Name
-		gitlabUser, err := getGitlabUser(user.Username)
+		gitlabUser, err := getGitlabUser(ctx, user.Username)
 		if err != nil {
 			return "", fmt.Errorf("retrieving gitlab user: %v", err)
 		}
@@ -648,7 +682,7 @@ func (p *project) prepareMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 	w.author = mergeRequest.Author.Name
 
-	author, err := getGitlabUser(mergeRequest.Author.Username)
+	author, err := getGitlabUser(ctx, mergeRequest.Author.Username)
 	if err != nil {
 		return nil, fmt.Errorf("retrieving gitlab user: %v", err)
 	}
@@ -666,7 +700,7 @@ func (p *project) prepareMergeRequest(ctx context.Context, mergeRequest *gitlab.
 			if award.Name == "thumbsup" {
 				approver := award.User.Name
 
-				approverUser, err := getGitlabUser(award.User.Username)
+				approverUser, err := getGitlabUser(ctx, award.User.Username)
 				if err != nil {
 					sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
 					continue
@@ -857,7 +891,7 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 
 		githubCommentAuthorName := comment.Author.Name
 
-		commentAuthor, err := getGitlabUser(comment.Author.Username)
+		commentAuthor, err := getGitlabUser(ctx, comment.Author.Username)
 		if err != nil {
 			return false, fmt.Errorf("retrieving gitlab user: %v", err)
 		}
@@ -913,7 +947,7 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 	}
 
 	// Add a final comment describing what ultimately happened to the merge request on GitLab
-	if finalBody, err := p.mergeRequestFinalComment(mergeRequest); err != nil {
+	if finalBody, err := p.mergeRequestFinalComment(ctx, mergeRequest); err != nil {
 		return false, err
 	} else if finalBody != "" {
 		foundExistingFinal := false

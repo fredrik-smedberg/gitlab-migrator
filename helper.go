@@ -85,11 +85,11 @@ func getGithubUser(ctx context.Context, username string) (*github.User, error) {
 	return user, nil
 }
 
-func getGitlabUser(username string) (*gitlab.User, error) {
+func getGitlabUser(ctx context.Context, username string) (*gitlab.User, error) {
 	user := cache.getGitlabUser(username)
 	if user == nil {
 		logger.Debug("retrieving user details", "username", username)
-		users, _, err := gl.Users.ListUsers(&gitlab.ListUsersOptions{Username: &username})
+		users, _, err := gl.Users.ListUsers(&gitlab.ListUsersOptions{Username: &username}, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, err
 		}
