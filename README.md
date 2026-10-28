@@ -61,6 +61,8 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
         when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated (default true)
   -migrate-pull-requests
         whether pull requests should be migrated
+  -no-progress
+        disable the live progress bars (they are also disabled when stderr is not a terminal)
   -no-prompt
         skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs
   -projects-csv string
@@ -147,7 +149,9 @@ Within a project, merge requests are read from GitLab in parallel, while git ope
 - `-merge-request-concurrency` sets how many merge requests per project are read from GitLab in parallel (default 4).
 - `-github-writes-per-hour` sets the maximum content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour, across all projects; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes. Each rate-limited write halves the limit, down to 100 per hour. When GitHub reports a rate limit, all GitHub API requests pause until it has passed.
 
-GitHub writes are therefore the bottleneck for projects with many merge requests, and more workers will not speed them up. See [GitHub API docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) for details.
+GitHub writes are therefore the bottleneck for projects with many merge requests, and more workers will not speed them up.
+
+When stderr is a terminal, a live progress bar per project shows the current phase, progress, rate, ETA and elapsed time, with log lines printed above it. Pass `-no-progress` to turn it off; it is off automatically when output is redirected. See [GitHub API docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) for details.
 
 Specify `-loop` to continue migrating projects until canceled. This is useful for daemonizing the migration tool, or automatically restarting when migrating a large number of projects (or a small number of very large projects).
 
