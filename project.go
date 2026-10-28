@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -382,13 +383,9 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 		logger.Info("migrated merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "successful", successCount, "failed", failureCount, "skipped", skippedCount)
 	}()
 
-	work := make([]*mrWork, 0, len(mergeRequests))
+	// Select the merge requests to prepare, in GitLab order.
+	selected := make([]*gitlab.MergeRequest, 0, len(mergeRequests))
 	for _, mergeRequest := range mergeRequests {
-		if err := ctx.Err(); err != nil {
-			sendErr(fmt.Errorf("preparing merge requests: %v", err))
-			return
-		}
-
 		if mergeRequest == nil {
 			continue
 		}
@@ -398,10 +395,27 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 			continue
 		}
 
-		w, err := p.prepareMergeRequest(ctx, mergeRequest, index)
-		if err != nil {
-			sendErr(err)
+		selected = append(selected, mergeRequest)
+	}
+
+	prepared, errs := p.prepareMergeRequests(ctx, selected, index)
+
+	// The worker pool in prepareMergeRequests has fully finished here. It must not overlap
+	// pushTemporaryBranches: the git phase writes to the in-memory go-git storage, which has no locks.
+	if err := ctx.Err(); err != nil {
+		sendErr(fmt.Errorf("preparing merge requests: %v", err))
+		return
+	}
+
+	// Report errors and drop failed merge requests in GitLab order, so log output and counts are deterministic.
+	work := make([]*mrWork, 0, len(selected))
+	for i, w := range prepared {
+		if errs[i] != nil {
+			sendErr(errs[i])
 			failureCount++
+			continue
+		}
+		if w == nil {
 			continue
 		}
 		work = append(work, w)
@@ -632,6 +646,54 @@ func (p *project) temporaryBranchHashes(ctx context.Context, mergeRequest *gitla
 
 	// Sometimes we will be starting from a merge commit, so branch out from its first parent
 	return plumbing.NewHash(commits[len(commits)-1].ID), plumbing.NewHash(startCommit.ParentIDs[0]), "", nil
+}
+
+// prepareMergeRequests runs prepareMergeRequest for each merge request in a pool of
+// mergeRequestConcurrency workers. Result i belongs to mergeRequests[i]; each worker writes only
+// its own index of work and errs. A panic while preparing one merge request becomes that merge
+// request's error. Merge requests not started before ctx is canceled have neither result nor error.
+func (p *project) prepareMergeRequests(ctx context.Context, mergeRequests []*gitlab.MergeRequest, index *githubIndex) ([]*mrWork, []error) {
+	work := make([]*mrWork, len(mergeRequests))
+	errs := make([]error, len(mergeRequests))
+
+	concurrency := max(mergeRequestConcurrency, 1)
+	concurrency = min(concurrency, len(mergeRequests))
+
+	queue := make(chan int)
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range queue {
+				if ctx.Err() != nil {
+					continue // drain the queue without starting new merge requests
+				}
+				work[i], errs[i] = p.safePrepareMergeRequest(ctx, mergeRequests[i], index)
+			}
+		}()
+	}
+
+	for i := range mergeRequests {
+		if ctx.Err() != nil {
+			break
+		}
+		queue <- i
+	}
+	close(queue)
+	wg.Wait()
+
+	return work, errs
+}
+
+// safePrepareMergeRequest calls prepareMergeRequest and converts a panic into an error.
+func (p *project) safePrepareMergeRequest(ctx context.Context, mergeRequest *gitlab.MergeRequest, index *githubIndex) (w *mrWork, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			w, err = nil, fmt.Errorf("merge request %d: panic: %v", mergeRequest.IID, r)
+		}
+	}()
+	return p.prepareMergeRequest(ctx, mergeRequest, index)
 }
 
 // prepareMergeRequest reads everything needed to migrate a merge request from

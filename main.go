@@ -43,14 +43,15 @@ var gitlabCABundle []byte
 var mergeRequestsAge int
 
 var (
-	cache               *objectCache
-	errCount            atomic.Int64
-	logger              hclog.Logger
-	gh                  *github.Client
-	gl                  *gitlab.Client
-	maxConcurrency      int
-	githubWritesPerHour int
-	version             = "development"
+	cache                   *objectCache
+	errCount                atomic.Int64
+	logger                  hclog.Logger
+	gh                      *github.Client
+	gl                      *gitlab.Client
+	maxConcurrency          int
+	mergeRequestConcurrency int
+	githubWritesPerHour     int
+	version                 = "development"
 )
 
 type Project = []string
@@ -127,6 +128,7 @@ func main() {
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
+	flag.IntVar(&mergeRequestConcurrency, "merge-request-concurrency", 4, "how many merge requests per project to read from GitLab in parallel; git operations and GitHub writes stay serial")
 	flag.IntVar(&githubWritesPerHour, "github-writes-per-hour", 500, "maximum number of content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour across all projects; 0 or less disables the limit")
 
 	flag.Parse()
