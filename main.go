@@ -43,13 +43,14 @@ var gitlabCABundle []byte
 var mergeRequestsAge int
 
 var (
-	cache          *objectCache
-	errCount       atomic.Int64
-	logger         hclog.Logger
-	gh             *github.Client
-	gl             *gitlab.Client
-	maxConcurrency int
-	version        = "development"
+	cache               *objectCache
+	errCount            atomic.Int64
+	logger              hclog.Logger
+	gh                  *github.Client
+	gl                  *gitlab.Client
+	maxConcurrency      int
+	githubWritesPerHour int
+	version             = "development"
 )
 
 type Project = []string
@@ -59,6 +60,8 @@ type Report struct {
 	ProjectName        string
 	MergeRequestsCount int
 }
+
+var rateLimitMessage = regexp.MustCompile(`(?i)rate limit`)
 
 type GitHubError struct {
 	Message          string
@@ -124,6 +127,7 @@ func main() {
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
+	flag.IntVar(&githubWritesPerHour, "github-writes-per-hour", 500, "maximum number of content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour across all projects; 0 or less disables the limit")
 
 	flag.Parse()
 
@@ -212,7 +216,7 @@ func main() {
 		HTTPClient:   cleanhttp.DefaultPooledClient(),
 		Logger:       nil,
 		RetryMax:     8,
-		RetryWaitMin: 30 * time.Second,
+		RetryWaitMin: 5 * time.Second,
 		RetryWaitMax: 300 * time.Second,
 	}
 
@@ -220,18 +224,21 @@ func main() {
 		requestMethod := "unknown"
 		requestUrl := "unknown"
 
-		if req := resp.Request; req != nil {
-			requestMethod = req.Method
-			if req.URL != nil {
-				requestUrl = req.URL.String()
-			}
-		}
+		status := 0
 
 		defer func() {
-			logger.Trace("waiting before retrying failed API request", "method", requestMethod, "url", requestUrl, "status", resp.StatusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
+			logger.Trace("waiting before retrying failed API request", "method", requestMethod, "url", requestUrl, "status", status, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
 		}()
 
 		if resp != nil {
+			status = resp.StatusCode
+			if req := resp.Request; req != nil {
+				requestMethod = req.Method
+				if req.URL != nil {
+					requestUrl = req.URL.String()
+				}
+			}
+
 			// Check the Retry-After header
 			if s, ok := resp.Header["Retry-After"]; ok {
 				if retryAfter, err := strconv.ParseInt(s[0], 10, 64); err == nil {
@@ -274,8 +281,9 @@ func main() {
 	}
 
 	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		// Retry network errors, but not certificate or redirect errors
 		if err != nil {
-			return false, err
+			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 		}
 
 		// Potential connection reset
@@ -301,11 +309,16 @@ func main() {
 				}
 				return false, fmt.Errorf("received 403 with response: %v", msg)
 			}
+
+			// Only retry a 403 when it is a rate limit, not a permission error
+			if resp.Header.Get("Retry-After") == "" && !rateLimitMessage.MatchString(errResp.Message) {
+				return false, nil
+			}
 		}
 
 		retryableStatuses := []int{
 			http.StatusTooManyRequests, // rate-limiting
-			http.StatusForbidden,       // rate-limiting
+			http.StatusForbidden,       // rate-limiting (other 403s are rejected above)
 
 			http.StatusRequestTimeout,
 			http.StatusFailedDependency,
@@ -335,7 +348,9 @@ func main() {
 		return false, nil
 	}
 
-	transport := &retryablehttp.RoundTripper{Client: retryClient}
+	// The throttle wraps the retrying transport, so all retry attempts of one request happen inside
+	// a single throttled call, and a pause set from a 403/429 applies to all later calls.
+	transport := newThrottlingTransport(&retryablehttp.RoundTripper{Client: retryClient}, githubWritesPerHour)
 	client := githubpagination.NewClient(transport, githubpagination.WithPerPage(100))
 
 	if githubDomain == defaultGithubDomain {
