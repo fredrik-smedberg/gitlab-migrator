@@ -198,7 +198,7 @@ func roundDuration(d, r time.Duration) time.Duration {
 }
 
 func sendErr(err error) {
-	errCount++
+	errCount.Add(1)
 	logger.Error(err.Error())
 }
 

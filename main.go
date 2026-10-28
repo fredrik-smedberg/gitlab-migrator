@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofri/go-github-pagination/githubpagination"
@@ -40,7 +41,7 @@ var mergeRequestsAge int
 
 var (
 	cache          *objectCache
-	errCount       int
+	errCount       atomic.Int64
 	logger         hclog.Logger
 	gh             *github.Client
 	gl             *gitlab.Client
@@ -387,8 +388,8 @@ func main() {
 		if err = performMigration(ctx, projects); err != nil {
 			sendErr(err)
 			os.Exit(1)
-		} else if errCount > 0 {
-			logger.Warn(fmt.Sprintf("encountered %d errors during migration, review log output for details", errCount))
+		} else if errCount.Load() > 0 {
+			logger.Warn(fmt.Sprintf("encountered %d errors during migration, review log output for details", errCount.Load()))
 			os.Exit(1)
 		}
 	}
@@ -406,7 +407,6 @@ func printReport(ctx context.Context, projects []Project) {
 
 		result, err := reportProject(ctx, proj)
 		if err != nil {
-			errCount++
 			sendErr(err)
 		}
 
@@ -511,13 +511,11 @@ func performMigration(ctx context.Context, projects []Project) error {
 
 				proj, err := newProject(slugs)
 				if err != nil {
-					errCount++
 					sendErr(err)
 					continue
 				}
 
 				if err := proj.migrate(ctx); err != nil {
-					errCount++
 					sendErr(err)
 				}
 			}
@@ -545,8 +543,9 @@ func performMigration(ctx context.Context, projects []Project) error {
 		}
 	} else {
 		queueProjects()
-		close(queue)
 	}
+
+	close(queue)
 
 	wg.Wait()
 
