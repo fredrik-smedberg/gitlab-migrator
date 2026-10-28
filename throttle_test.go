@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"golang.org/x/time/rate"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -197,5 +199,48 @@ func TestPauseSetDuringWriteWaitIsHonoured(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 1400*time.Millisecond {
 		t.Fatalf("second write finished after %v, want >= 1.4s (pause set during limiter wait)", elapsed)
+	}
+}
+
+func TestRateLimitedWriteLowersWriteLimit(t *testing.T) {
+	ensureTestLogger()
+	stub := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return okResponse(http.StatusForbidden, http.Header{"Retry-After": []string{"1"}}), nil
+	})
+	tr := newThrottlingTransport(stub, 3600)
+	before := tr.writes.Limit()
+
+	resp, err := tr.RoundTrip(newTestRequest(t, http.MethodPost))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if got, want := tr.writes.Limit(), before/2; math.Abs(float64(got-want)) > 1e-9 {
+		t.Fatalf("write limit after rate-limited POST = %v, want %v", got, want)
+	}
+
+	// A rate-limited read leaves the write limit alone. Its Retry-After pause is not waited for
+	// here; the request below would wait one second for the pause set above.
+	tr.mu.Lock()
+	tr.pausedUntil = time.Time{}
+	tr.mu.Unlock()
+	resp, err = tr.RoundTrip(newTestRequest(t, http.MethodGet))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got, want := tr.writes.Limit(), before/2; math.Abs(float64(got-want)) > 1e-9 {
+		t.Fatalf("write limit after rate-limited GET = %v, want %v", got, want)
+	}
+}
+
+func TestWriteLimitFloor(t *testing.T) {
+	ensureTestLogger()
+	tr := newThrottlingTransport(roundTripFunc(nil), 150)
+	tr.lowerWriteRate()
+	tr.lowerWriteRate()
+	if got, want := tr.writes.Limit(), rate.Every(time.Hour/minWritesPerHour); math.Abs(float64(got-want)) > 1e-12 {
+		t.Fatalf("write limit = %v, want floor %v", got, want)
 	}
 }

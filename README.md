@@ -40,7 +40,7 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -github-user string
         specifies the GitHub user to use, who will author any migrated PRs (required)
   -github-writes-per-hour int
-        maximum number of content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour across all projects; 0 or less disables the limit (default 500)
+        maximum content-creating GitHub API requests per hour; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes; 0 or less disables the limit (default 500)
   -gitlab-domain string
         specifies the GitLab domain to use (may include a port, e.g. gitlab.example.com:8080) (default "gitlab.com")
   -gitlab-insecure
@@ -145,7 +145,7 @@ By default, 4 workers will be spawned to migrate up to 4 projects in parallel. Y
 Within a project, merge requests are read from GitLab in parallel, while git operations and GitHub writes run serially:
 
 - `-merge-request-concurrency` sets how many merge requests per project are read from GitLab in parallel (default 4).
-- `-github-writes-per-hour` limits content-creating GitHub API requests (POST, PATCH, PUT, DELETE) across all projects (default 500, GitHub's secondary rate limit). When GitHub reports a rate limit, all GitHub API requests pause until it has passed.
+- `-github-writes-per-hour` sets the maximum content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour, across all projects; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes. Each rate-limited write halves the limit, down to 100 per hour. When GitHub reports a rate limit, all GitHub API requests pause until it has passed.
 
 GitHub writes are therefore the bottleneck for projects with many merge requests, and more workers will not speed them up. See [GitHub API docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) for details.
 
