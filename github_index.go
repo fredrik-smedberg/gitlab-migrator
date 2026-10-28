@@ -51,7 +51,7 @@ func buildGithubIndex(ctx context.Context, owner, repo string) (*githubIndex, er
 			if pr.GetNumber() < existing.GetNumber() {
 				kept, dropped = pr, existing
 			}
-			logger.Warn("multiple pull requests found for merge request, using the lowest number", "owner", owner, "repo", repo, "merge_request_id", iid, "pr_number", kept.GetNumber(), "ignored_pr_number", dropped.GetNumber())
+			logger.Warn("multiple pull requests found for merge request, using the lowest number; the higher-numbered pull request is left untouched and should be removed manually", "owner", owner, "repo", repo, "merge_request_id", iid, "pr_number", kept.GetNumber(), "ignored_pr_number", dropped.GetNumber())
 			index.pullRequests[iid] = kept
 			continue
 		}

@@ -63,7 +63,7 @@ func sortCommitsByDate(commits []*gitlab.Commit) {
 	})
 }
 
-func newProject(slugs []string) (*project, error) {
+func newProject(ctx context.Context, slugs []string) (*project, error) {
 	var err error
 	p := &project{}
 
@@ -73,7 +73,7 @@ func newProject(slugs []string) (*project, error) {
 	}
 
 	logger.Info("searching for GitLab project", "name", p.gitlabPath[1], "group", p.gitlabPath[0])
-	p.project, _, err = gl.Projects.GetProject(slugs[0], nil)
+	p.project, _, err = gl.Projects.GetProject(slugs[0], nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("retrieving project: %v", err)
 	}
@@ -357,7 +357,7 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 
 	logger.Debug("retrieving GitLab merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID)
 	for {
-		result, resp, err := gl.MergeRequests.ListProjectMergeRequests(p.project.ID, opts)
+		result, resp, err := gl.MergeRequests.ListProjectMergeRequests(p.project.ID, opts, gitlab.WithContext(ctx))
 		if err != nil {
 			sendErr(fmt.Errorf("retrieving gitlab merge requests: %v", err))
 			return
@@ -506,13 +506,18 @@ func (p *project) fetchCommitsBySHA(ctx context.Context, shas []string) error {
 	}
 
 	logger.Debug("fetching commits by SHA failed, fetching one by one", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", len(missing), "error", err)
+	failed := 0
 	for _, sha := range missing {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := p.fetchMissingCommits(ctx, []string{sha}); err != nil {
+			failed++
 			logger.Debug("fetching commit by SHA failed", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", sha, "error", err)
 		}
+	}
+	if failed > 0 {
+		logger.Info(fmt.Sprintf("%d commits could not be fetched from GitLab", failed), "name", p.gitlabPath[1], "group", p.gitlabPath[0])
 	}
 
 	return nil

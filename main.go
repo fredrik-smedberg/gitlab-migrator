@@ -554,7 +554,7 @@ func performMigration(ctx context.Context, projects []Project) error {
 					break
 				}
 
-				proj, err := newProject(slugs)
+				proj, err := newProject(ctx, slugs)
 				if err != nil {
 					sendErr(err)
 					continue
