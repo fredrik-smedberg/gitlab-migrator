@@ -170,6 +170,8 @@ func TestPushTemporaryBranchesSkipsSourceWithoutNewCommits(t *testing.T) {
 	work := []*mrWork{
 		{mr: &gitlab.MergeRequest{IID: 1}, needsBranch: true, sourceHash: base, targetHash: head, sourceRef: "s1", targetRef: "t1"},
 		{mr: &gitlab.MergeRequest{IID: 2}, needsBranch: true, sourceHash: head, targetHash: head, sourceRef: "s2", targetRef: "t2"},
+		// diff_refs path: equal hashes are still skipped without an ancestor walk.
+		{mr: &gitlab.MergeRequest{IID: 3}, needsBranch: true, fromDiffRefs: true, sourceHash: head, targetHash: head, sourceRef: "s3", targetRef: "t3"},
 	}
 
 	// All commits are present and every merge request is skipped, so nothing is fetched or pushed

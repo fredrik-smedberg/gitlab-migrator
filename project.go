@@ -329,10 +329,13 @@ type mrWork struct {
 	sourceHash  plumbing.Hash       // set when temporary branches are needed
 	targetHash  plumbing.Hash
 	needsBranch bool
-	notes       []*gitlab.Note
-	approvers   []string
-	author      string
-	skip        string // non-empty: skip the merge request with an Info log
+	// fromDiffRefs: sourceHash and targetHash are diff_refs head_sha and base_sha.
+	// base_sha is the merge base, so the source is an ancestor of the target only when they are equal.
+	fromDiffRefs bool
+	notes        []*gitlab.Note
+	approvers    []string
+	author       string
+	skip         string // non-empty: skip the merge request with an Info log
 }
 
 // migrateMergeRequests migrates the merge requests of the project in phases:
@@ -603,47 +606,48 @@ func (p *project) mergeRequestFinalComment(ctx context.Context, mergeRequest *gi
 // target is the first parent of its first commit, read from the GitLab API.
 // No git work is done here; the commits are fetched in pushTemporaryBranches.
 // A non-empty skip is the reason the merge request should be skipped.
-func (p *project) temporaryBranchHashes(ctx context.Context, mergeRequest *gitlab.MergeRequest) (source, target plumbing.Hash, skip string, err error) {
+// fromDiffRefs reports whether the hashes came from diff_refs.
+func (p *project) temporaryBranchHashes(ctx context.Context, mergeRequest *gitlab.MergeRequest) (source, target plumbing.Hash, fromDiffRefs bool, skip string, err error) {
 	logger.Trace("retrieving diff refs for merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 	mr, _, err := gl.MergeRequests.GetMergeRequest(p.project.ID, mergeRequest.IID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return source, target, "", fmt.Errorf("retrieving merge request: %v", err)
+		return source, target, false, "", fmt.Errorf("retrieving merge request: %v", err)
 	}
 
 	if mr.DiffRefs.BaseSha != "" && mr.DiffRefs.HeadSha != "" {
-		return plumbing.NewHash(mr.DiffRefs.HeadSha), plumbing.NewHash(mr.DiffRefs.BaseSha), "", nil
+		return plumbing.NewHash(mr.DiffRefs.HeadSha), plumbing.NewHash(mr.DiffRefs.BaseSha), true, "", nil
 	}
 
 	logger.Trace("merge request has no diff refs, retrieving commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 	commits, err := listMergeRequestCommits(ctx, p.project.ID, mergeRequest.IID)
 	if err != nil {
-		return source, target, "", fmt.Errorf("retrieving merge request commits: %v", err)
+		return source, target, false, "", fmt.Errorf("retrieving merge request commits: %v", err)
 	}
 	if len(commits) == 0 {
-		return source, target, "merge request has no commits", nil
+		return source, target, false, "merge request has no commits", nil
 	}
 
 	for _, commit := range commits {
 		if commit == nil {
-			return source, target, "", fmt.Errorf("merge request %d has a nil commit", mergeRequest.IID)
+			return source, target, false, "", fmt.Errorf("merge request %d has a nil commit", mergeRequest.IID)
 		}
 	}
 	// API is buggy, ordering is not respected, so we'll reorder by commit datestamp
 	sortCommitsByDate(commits)
 	startCommit, _, err := gl.Commits.GetCommit(p.project.ID, commits[0].ID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return source, target, "", fmt.Errorf("retrieving start commit %s: %v", commits[0].ShortID, err)
+		return source, target, false, "", fmt.Errorf("retrieving start commit %s: %v", commits[0].ShortID, err)
 	}
 	if len(startCommit.ParentIDs) == 0 {
 		// Orphaned commit, we cannot open a pull request as GitHub rejects it
 		if !skipInvalidMergeRequests {
-			return source, target, "", fmt.Errorf("start commit %s for merge request %d has no parents", commits[0].ShortID, mergeRequest.IID)
+			return source, target, false, "", fmt.Errorf("start commit %s for merge request %d has no parents", commits[0].ShortID, mergeRequest.IID)
 		}
-		return source, target, "start commit has no parents", nil
+		return source, target, false, "start commit has no parents", nil
 	}
 
 	// Sometimes we will be starting from a merge commit, so branch out from its first parent
-	return plumbing.NewHash(commits[len(commits)-1].ID), plumbing.NewHash(startCommit.ParentIDs[0]), "", nil
+	return plumbing.NewHash(commits[len(commits)-1].ID), plumbing.NewHash(startCommit.ParentIDs[0]), false, "", nil
 }
 
 // prepareMergeRequests runs prepareMergeRequest for each merge request in a pool of
@@ -726,7 +730,7 @@ func (p *project) prepareMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		w.targetRef = fmt.Sprintf("migration-target-%d/%s", mergeRequest.IID, mergeRequest.TargetBranch)
 
 		var err error
-		w.sourceHash, w.targetHash, w.skip, err = p.temporaryBranchHashes(ctx, mergeRequest)
+		w.sourceHash, w.targetHash, w.fromDiffRefs, w.skip, err = p.temporaryBranchHashes(ctx, mergeRequest)
 		if err != nil {
 			return nil, err
 		}

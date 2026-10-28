@@ -96,8 +96,10 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 
 		// GitHub rejects a pull request without commits between base and head, so skip it here
 		// instead of pushing branches for a pull request that cannot be created.
+		// With diff_refs the target is the merge base, so the source can only be its ancestor
+		// when both are the same commit; the ancestor walk is only needed on the fallback path.
 		noCommits := sourceCommit.Hash == targetCommit.Hash
-		if !noCommits {
+		if !noCommits && !w.fromDiffRefs {
 			if noCommits, err = sourceCommit.IsAncestor(targetCommit); err != nil {
 				// Not decisive; push the branches and let GitHub decide.
 				logger.Warn("could not check whether source commit is an ancestor of target commit", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "merge_request_id", w.mr.IID, "error", err)
