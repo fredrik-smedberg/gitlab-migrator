@@ -72,6 +72,11 @@ type GitHubError struct {
 func main() {
 	var err error
 
+	logger = hclog.New(&hclog.LoggerOptions{
+		Name:  "gitlab-migrator",
+		Level: hclog.LevelFromString(os.Getenv("LOG_LEVEL")),
+	})
+
 	// Bypass pre-emptive rate limit checks in the GitHub client, as we will handle these via go-retryablehttp
 	valueCtx := context.WithValue(context.Background(), github.BypassRateLimitCheck, true)
 
@@ -87,15 +92,13 @@ func main() {
 	go func() {
 		select {
 		case <-c:
+			logger.Warn("interrupt received, finishing cleanup; press Ctrl-C again to exit immediately")
 			cancel()
+			// Restore the default action so a second Ctrl-C terminates the process.
+			signal.Stop(c)
 		case <-ctx.Done():
 		}
 	}()
-
-	logger = hclog.New(&hclog.LoggerOptions{
-		Name:  "gitlab-migrator",
-		Level: hclog.LevelFromString(os.Getenv("LOG_LEVEL")),
-	})
 
 	cache = newObjectCache()
 
