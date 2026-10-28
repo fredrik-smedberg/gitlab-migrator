@@ -16,6 +16,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/hashicorp/go-hclog"
+	"github.com/xanzy/go-gitlab"
 )
 
 func TestChunk(t *testing.T) {
@@ -125,4 +126,72 @@ func TestFetchCommitsBySHASingleMissingReturnsError(t *testing.T) {
 	if err := p.fetchCommitsBySHA(context.Background(), []string{strings.Repeat("1", 40)}); err == nil {
 		t.Error("expected an error when the only commit cannot be fetched")
 	}
+}
+
+// storeCommit stores a commit with an empty tree and the given parents and returns its hash.
+func storeCommit(t *testing.T, repo *git.Repository, msg string, parents ...plumbing.Hash) plumbing.Hash {
+	t.Helper()
+
+	treeObj := repo.Storer.NewEncodedObject()
+	if err := (&object.Tree{}).Encode(treeObj); err != nil {
+		t.Fatalf("encoding tree: %v", err)
+	}
+	treeHash, err := repo.Storer.SetEncodedObject(treeObj)
+	if err != nil {
+		t.Fatalf("storing tree: %v", err)
+	}
+
+	sig := object.Signature{Name: "test", Email: "test@example.com", When: time.Unix(1700000000, 0)}
+	commit := &object.Commit{Author: sig, Committer: sig, Message: msg, TreeHash: treeHash, ParentHashes: parents}
+	commitObj := repo.Storer.NewEncodedObject()
+	if err := commit.Encode(commitObj); err != nil {
+		t.Fatalf("encoding commit: %v", err)
+	}
+	hash, err := repo.Storer.SetEncodedObject(commitObj)
+	if err != nil {
+		t.Fatalf("storing commit: %v", err)
+	}
+	return hash
+}
+
+func TestPushTemporaryBranchesSkipsSourceWithoutNewCommits(t *testing.T) {
+	if logger == nil {
+		logger = hclog.NewNullLogger()
+	}
+
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		t.Fatalf("initializing repository: %v", err)
+	}
+	base := storeCommit(t, repo, "base")
+	head := storeCommit(t, repo, "head", base)
+
+	const reason = "source branch has no commits beyond the target branch"
+	work := []*mrWork{
+		{mr: &gitlab.MergeRequest{IID: 1}, needsBranch: true, sourceHash: base, targetHash: head, sourceRef: "s1", targetRef: "t1"},
+		{mr: &gitlab.MergeRequest{IID: 2}, needsBranch: true, sourceHash: head, targetHash: head, sourceRef: "s2", targetRef: "t2"},
+	}
+
+	// All commits are present and every merge request is skipped, so nothing is fetched or pushed
+	// and no remotes are needed.
+	p := &project{repo: repo, gitlabPath: []string{"group", "name"}, githubPath: []string{"owner", "repo"}, project: &gitlab.Project{}}
+	if err := p.pushTemporaryBranches(context.Background(), work); err != nil {
+		t.Fatalf("pushTemporaryBranches: %v", err)
+	}
+
+	for _, w := range work {
+		if w.skip != reason {
+			t.Errorf("merge request %d: skip = %q, want %q", w.mr.IID, w.skip, reason)
+		}
+	}
+	refs, err := repo.References()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().IsBranch() {
+			t.Errorf("unexpected local branch %s", ref.Name())
+		}
+		return nil
+	})
 }
