@@ -82,15 +82,29 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 		}
 
 		// Skip rather than fail at push time if an object is missing
-		missing := false
-		for _, hash := range []plumbing.Hash{w.sourceHash, w.targetHash} {
-			if _, err := object.GetCommit(p.repo.Storer, hash); err != nil {
-				w.skip = fmt.Sprintf("commit %s not found after fetch", hash)
-				missing = true
-				break
+		sourceCommit, err := object.GetCommit(p.repo.Storer, w.sourceHash)
+		if err != nil {
+			w.skip = fmt.Sprintf("commit %s not found after fetch", w.sourceHash)
+			continue
+		}
+		targetCommit, err := object.GetCommit(p.repo.Storer, w.targetHash)
+		if err != nil {
+			w.skip = fmt.Sprintf("commit %s not found after fetch", w.targetHash)
+			continue
+		}
+
+		// GitHub rejects a pull request without commits between base and head, so skip it here
+		// instead of pushing branches for a pull request that cannot be created.
+		noCommits := sourceCommit.Hash == targetCommit.Hash
+		if !noCommits {
+			if noCommits, err = sourceCommit.IsAncestor(targetCommit); err != nil {
+				// Not decisive; push the branches and let GitHub decide.
+				logger.Warn("could not check whether source commit is an ancestor of target commit", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "merge_request_id", w.mr.IID, "error", err)
+				noCommits = false
 			}
 		}
-		if missing {
+		if noCommits {
+			w.skip = "source branch has no commits beyond the target branch"
 			continue
 		}
 
