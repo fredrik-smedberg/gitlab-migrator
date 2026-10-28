@@ -411,17 +411,28 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 	}
 
 	// Report errors and drop failed merge requests in GitLab order, so log output and counts are deterministic.
+	// Prepare errors for merge requests without a pull request abort the project: creating the
+	// others would shift GitHub pull request numbers away from GitLab merge request order.
 	work := make([]*mrWork, 0, len(selected))
+	var unnumbered []int
 	for i, w := range prepared {
 		if errs[i] != nil {
 			sendErr(errs[i])
 			failureCount++
+			if index.pullRequests[selected[i].IID] == nil {
+				unnumbered = append(unnumbered, selected[i].IID)
+			}
 			continue
 		}
 		if w == nil {
 			continue
 		}
 		work = append(work, w)
+	}
+
+	if len(unnumbered) > 0 {
+		sendErr(fmt.Errorf("aborting merge request migration for %s/%s to keep pull request numbers in merge request order: merge requests %v without a pull request failed to prepare; rerun after fixing the cause", p.gitlabPath[0], p.gitlabPath[1], unnumbered))
+		return
 	}
 
 	// Registered before pushing so that partially pushed branches are also deleted.
@@ -894,7 +905,7 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 				logger.Debug("skipping merge request as the change is already present in trunk branch", "owner", p.githubPath[0], "repo", p.githubPath[1], "merge_request_id", mergeRequest.IID)
 				return false, nil
 			}
-			return false, fmt.Errorf("creating pull request: %v", err)
+			return false, fmt.Errorf("creating pull request for merge request %d: %v; pull request numbers are now shifted for the remaining merge requests", mergeRequest.IID, err)
 		}
 
 		if mergeRequest.State == "closed" || mergeRequest.State == "merged" {
