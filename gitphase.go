@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -14,9 +15,9 @@ import (
 )
 
 const (
-	fetchChunkSize  = 200 // commit SHAs per fetch from GitLab
-	pushChunkSize   = 100 // refspecs per push of temporary branches
-	deleteChunkSize = 200 // refspecs per push of temporary branch deletions
+	fetchChunkSize  = 200  // commit SHAs per fetch from GitLab
+	pushChunkSize   = 500  // refspecs per push of temporary branches
+	deleteChunkSize = 1000 // refspecs per push of temporary branch deletions
 )
 
 // chunk splits items into consecutive slices of at most size elements. A size
@@ -143,8 +144,17 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 // branches on GitHub, including leftovers from earlier interrupted runs. The
 // branches are listed from GitHub directly, not from the branch cache, which
 // does not know about the temporary branches.
-func (p *project) deleteTemporaryBranches(ctx context.Context) error {
-	branches, _, err := gh.Repositories.ListBranches(ctx, p.githubPath[0], p.githubPath[1], &github.BranchListOptions{
+//
+// Cleanup must also run after Ctrl-C, so it never uses ctx's cancellation and
+// sets its own deadlines instead: two minutes for listing the branches, and for
+// the deletions five minutes plus one second per branch, or two minutes when
+// cancelled is true (the user interrupted the run and is waiting for it to end).
+func (p *project) deleteTemporaryBranches(ctx context.Context, cancelled bool) error {
+	baseCtx := context.WithoutCancel(ctx)
+
+	listCtx, listCancel := context.WithTimeout(baseCtx, 2*time.Minute)
+	defer listCancel()
+	branches, _, err := gh.Repositories.ListBranches(listCtx, p.githubPath[0], p.githubPath[1], &github.BranchListOptions{
 		ListOptions: github.ListOptions{PerPage: 100},
 	})
 	if err != nil {
@@ -164,9 +174,16 @@ func (p *project) deleteTemporaryBranches(ctx context.Context) error {
 		return nil
 	}
 
+	deadline := 5*time.Minute + time.Duration(len(refSpecs))*time.Second
+	if cancelled {
+		deadline = 2 * time.Minute
+	}
+	deleteCtx, deleteCancel := context.WithTimeout(baseCtx, deadline)
+	defer deleteCancel()
+
 	for _, refSpecChunk := range chunk(refSpecs, deleteChunkSize) {
 		logger.Debug("deleting temporary branches", "owner", p.githubPath[0], "repo", p.githubPath[1], "count", len(refSpecChunk))
-		if err := p.repo.PushContext(ctx, &git.PushOptions{
+		if err := p.repo.PushContext(deleteCtx, &git.PushOptions{
 			RemoteName: "github",
 			RefSpecs:   refSpecChunk,
 			Force:      true,
