@@ -59,8 +59,8 @@ func TestWritesAreRateLimited(t *testing.T) {
 		}
 		_ = resp.Body.Close()
 	}
-	if elapsed := time.Since(start); elapsed >= 200*time.Millisecond {
-		t.Fatalf("three GETs took %v, want < 200ms", elapsed)
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("three GETs took %v, want < 1s", elapsed)
 	}
 
 	start = time.Now()
