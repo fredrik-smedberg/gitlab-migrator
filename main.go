@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -37,6 +38,8 @@ const (
 var loop, report bool
 var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabScheme, gitlabToken, projectsCsvPath, renameTrunkBranch string
+var gitlabCAFile string
+var gitlabCABundle []byte
 var mergeRequestsAge int
 
 var (
@@ -102,6 +105,7 @@ func main() {
 	flag.BoolVar(&deleteExistingRepos, "delete-existing-repos", false, "whether existing repositories should be deleted before migrating")
 	flag.BoolVar(&enablePullRequests, "migrate-pull-requests", false, "whether pull requests should be migrated")
 	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to the GitLab API")
+	flag.StringVar(&gitlabCAFile, "gitlab-ca-file", "", "path to a PEM file with additional CA certificates to trust for the GitLab server")
 	flag.BoolVar(&migrateClosedMergeRequests, "migrate-closed-merge-requests", true, "when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated")
 	flag.BoolVar(&noPrompt, "no-prompt", false, "skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs")
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
@@ -353,6 +357,25 @@ func main() {
 			insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		}
 		gitlabOpts = append(gitlabOpts, gitlab.WithHTTPClient(insecureClient))
+	} else if gitlabCAFile != "" {
+		var err error
+		if gitlabCABundle, err = os.ReadFile(gitlabCAFile); err != nil {
+			logger.Error(fmt.Sprintf("reading -gitlab-ca-file: %v", err))
+			os.Exit(1)
+		}
+		pool, _ := x509.SystemCertPool()
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(gitlabCABundle) {
+			logger.Error(fmt.Sprintf("-gitlab-ca-file %s contains no valid PEM certificate", gitlabCAFile))
+			os.Exit(1)
+		}
+		caClient := cleanhttp.DefaultPooledClient()
+		if caTransport, ok := caClient.Transport.(*http.Transport); ok {
+			caTransport.TLSClientConfig = &tls.Config{RootCAs: pool}
+		}
+		gitlabOpts = append(gitlabOpts, gitlab.WithHTTPClient(caClient))
 	}
 	if gitlabScheme != defaultGitlabScheme || gitlabDomain != defaultGitlabDomain {
 		gitlabUrl := fmt.Sprintf("%s://%s", gitlabScheme, gitlabDomain)
@@ -528,7 +551,11 @@ func performMigration(ctx context.Context, projects []Project) error {
 				break
 			}
 
-			queue <- proj
+			select {
+			case queue <- proj:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 

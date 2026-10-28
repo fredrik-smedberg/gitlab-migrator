@@ -187,6 +187,7 @@ func (p *project) migrate(ctx context.Context) error {
 		Auth:       nil,
 		RemoteName: "gitlab",
 		Mirror:     true,
+		CABundle:   gitlabCABundle,
 	})
 	if err != nil {
 		return fmt.Errorf("cloning gitlab repo: %v", err)
@@ -404,6 +405,7 @@ func (p *project) fetchCommitsBySHA(ctx context.Context, shas []string) error {
 		RefSpecs:   refSpecs,
 		Force:      true,
 		Tags:       git.NoTags,
+		CABundle:   gitlabCABundle,
 	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return err
 	}
