@@ -93,7 +93,7 @@ func main() {
 
 	var showVersion bool
 	var mergeRequestsAgeRaw string
-	fmt.Printf(fmt.Sprintf("gitlab-migrator %s\n", version))
+	fmt.Printf("gitlab-migrator %s\n", version)
 
 	flag.BoolVar(&loop, "loop", false, "continue migrating until canceled")
 	flag.BoolVar(&report, "report", false, "report on primitives to be migrated instead of beginning migration")
