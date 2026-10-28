@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -18,7 +19,9 @@ import (
 //   - when GitHub answers 403 or 429 with a Retry-After header, all later requests, reads included,
 //     wait until that time has passed, since continuing to send requests while rate-limited risks a ban;
 //   - when a response says the primary rate limit is exhausted (X-Ratelimit-Remaining: 0), all later
-//     requests wait until X-Ratelimit-Reset plus a margin.
+//     requests wait until X-Ratelimit-Reset plus a margin;
+//   - when a write is rate-limited (403 or 429 with Retry-After or X-Ratelimit-Remaining: 0), the
+//     write limiter rate is halved, down to minWritesPerHour, so a too high setting corrects itself.
 //
 // The "github write" Debug line is logged per attempt, which is also what GitHub's rate limit counts.
 //
@@ -47,8 +50,10 @@ func (t *throttlingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return nil, err
 	}
 
+	isWrite := false
 	switch req.Method {
 	case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+		isWrite = true
 		if t.writes != nil {
 			if err := t.writes.Wait(ctx); err != nil {
 				return nil, err
@@ -66,7 +71,12 @@ func (t *throttlingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, err
 	}
 
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+	rateLimited := resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests
+	if rateLimited && isWrite && (resp.Header.Get("Retry-After") != "" || resp.Header.Get("X-Ratelimit-Remaining") == "0") {
+		t.lowerWriteRate()
+	}
+
+	if rateLimited {
 		if seconds, perr := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64); perr == nil && seconds > 0 {
 			pause := time.Duration(seconds) * time.Second
 			t.pauseUntil(time.Now().Add(pause))
@@ -84,6 +94,27 @@ func (t *throttlingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 
 	return resp, nil
+}
+
+// minWritesPerHour is the floor for lowerWriteRate.
+const minWritesPerHour = 100
+
+// lowerWriteRate halves the write limiter rate, down to minWritesPerHour. It does nothing when
+// the write limiter is disabled.
+func (t *throttlingTransport) lowerWriteRate() {
+	if t.writes == nil {
+		return
+	}
+
+	t.mu.Lock()
+	limit := t.writes.Limit() / 2
+	if floor := rate.Every(time.Hour / minWritesPerHour); limit < floor {
+		limit = floor
+	}
+	t.writes.SetLimit(limit)
+	t.mu.Unlock()
+
+	logger.Warn("GitHub rate-limited a write, lowering the write limit", "writes_per_hour", int(math.Round(float64(limit)*3600)))
 }
 
 // rateLimitResetMargin is added to X-Ratelimit-Reset before requests resume.

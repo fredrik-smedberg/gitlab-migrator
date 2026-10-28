@@ -132,7 +132,7 @@ func main() {
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
 	flag.IntVar(&mergeRequestConcurrency, "merge-request-concurrency", 4, "how many merge requests per project to read from GitLab in parallel; git operations and GitHub writes stay serial")
-	flag.IntVar(&githubWritesPerHour, "github-writes-per-hour", 500, "maximum number of content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour across all projects; 0 or less disables the limit")
+	flag.IntVar(&githubWritesPerHour, "github-writes-per-hour", 500, "maximum content-creating GitHub API requests per hour; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes; 0 or less disables the limit")
 
 	flag.Parse()
 
