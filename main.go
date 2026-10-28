@@ -36,7 +36,7 @@ const (
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
+var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noProgress, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabScheme, gitlabToken, projectsCsvPath, renameTrunkBranch string
 var gitlabCAFile string
 var gitlabCABundle []byte
@@ -72,9 +72,13 @@ type GitHubError struct {
 func main() {
 	var err error
 
+	// Log output goes through a switchable writer so it can be routed above the
+	// progress bars once those are enabled, after the flags are parsed.
+	logOutput := &switchableWriter{w: os.Stderr}
 	logger = hclog.New(&hclog.LoggerOptions{
-		Name:  "gitlab-migrator",
-		Level: hclog.LevelFromString(os.Getenv("LOG_LEVEL")),
+		Name:   "gitlab-migrator",
+		Level:  hclog.LevelFromString(os.Getenv("LOG_LEVEL")),
+		Output: logOutput,
 	})
 
 	// Bypass pre-emptive rate limit checks in the GitHub client, as we will handle these via go-retryablehttp
@@ -114,6 +118,7 @@ func main() {
 	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to the GitLab API")
 	flag.StringVar(&gitlabCAFile, "gitlab-ca-file", "", "path to a PEM file with additional CA certificates to trust for the GitLab server")
 	flag.BoolVar(&migrateClosedMergeRequests, "migrate-closed-merge-requests", true, "when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated")
+	flag.BoolVar(&noProgress, "no-progress", false, "disable the live progress bars (they are also disabled when stderr is not a terminal)")
 	flag.BoolVar(&noPrompt, "no-prompt", false, "skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs")
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
@@ -135,6 +140,13 @@ func main() {
 	flag.IntVar(&githubWritesPerHour, "github-writes-per-hour", 500, "maximum content-creating GitHub API requests per hour; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes; 0 or less disables the limit")
 
 	flag.Parse()
+
+	if !noProgress && !showVersion && !report {
+		enableProgress()
+		if progress != nil {
+			logOutput.set(progress)
+		}
+	}
 
 	if showVersion {
 		return
@@ -430,7 +442,10 @@ func main() {
 	if report {
 		printReport(ctx, projects)
 	} else {
-		if err = performMigration(ctx, projects); err != nil {
+		err = performMigration(ctx, projects)
+		progress.stop()
+		logOutput.set(os.Stderr)
+		if err != nil {
 			sendErr(err)
 			os.Exit(1)
 		} else if errCount.Load() > 0 {
@@ -539,6 +554,7 @@ func performMigration(ctx context.Context, projects []Project) error {
 	}
 
 	logger.Info(fmt.Sprintf("processing %d project(s) with %d workers", len(projects), concurrency))
+	progress.setProjects(len(projects))
 
 	var wg sync.WaitGroup
 	queue := make(chan Project, concurrency*2)
@@ -557,12 +573,14 @@ func performMigration(ctx context.Context, projects []Project) error {
 				proj, err := newProject(ctx, slugs)
 				if err != nil {
 					sendErr(err)
+					progress.projectDone()
 					continue
 				}
 
 				if err := proj.migrate(ctx); err != nil {
 					sendErr(err)
 				}
+				progress.projectDone()
 			}
 		}()
 	}

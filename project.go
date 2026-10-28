@@ -98,6 +98,7 @@ type project struct {
 	defaultBranch string
 	gitlabPath    []string
 	githubPath    []string
+	bar           *progressBar // nil when progress is disabled
 }
 
 func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted bool) error {
@@ -122,7 +123,10 @@ func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted b
 	return nil
 }
 
-func (p *project) migrate(ctx context.Context) error {
+func (p *project) migrate(ctx context.Context) (err error) {
+	p.bar = progress.newBar(p.gitlabPath[1])
+	defer func() { p.bar.finish(err != nil) }()
+
 	cloneUrl, err := url.Parse(p.project.HTTPURLToRepo)
 	if err != nil {
 		return fmt.Errorf("parsing clone URL: %v", err)
@@ -189,6 +193,7 @@ func (p *project) migrate(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("adding gitlab remote: %v", err)
 	}
+	p.bar.setPhase("cloning", 0)
 	if err = p.repo.FetchContext(ctx, &git.FetchOptions{
 		RemoteName: "gitlab",
 		Tags:       git.NoTags,
@@ -243,6 +248,7 @@ func (p *project) migrate(ctx context.Context) error {
 	}
 
 	logger.Debug("force-pushing branches to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
+	p.bar.setPhase("pushing branches", 0)
 	if err = p.repo.PushContext(ctx, &git.PushOptions{
 		RemoteName: "github",
 		Force:      true,
@@ -292,6 +298,7 @@ func (p *project) migrate(ctx context.Context) error {
 	}
 
 	logger.Debug("force-pushing tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+	p.bar.setPhase("pushing tags", 0)
 	if err = p.repo.PushContext(ctx, &git.PushOptions{
 		RemoteName: "github",
 		Force:      true,
@@ -356,6 +363,7 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 	}
 
 	logger.Debug("retrieving GitLab merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID)
+	p.bar.setPhase("listing merge requests", 0)
 	for {
 		result, resp, err := gl.MergeRequests.ListProjectMergeRequests(p.project.ID, opts, gitlab.WithContext(ctx))
 		if err != nil {
@@ -372,6 +380,7 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 		opts.Page = resp.NextPage
 	}
 
+	p.bar.setPhase("indexing pull requests", 0)
 	index, err := buildGithubIndex(ctx, p.githubPath[0], p.githubPath[1])
 	if err != nil {
 		sendErr(fmt.Errorf("indexing GitHub repository: %v", err))
@@ -401,6 +410,7 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 		selected = append(selected, mergeRequest)
 	}
 
+	p.bar.setPhase("preparing", len(selected))
 	prepared, errs := p.prepareMergeRequests(ctx, selected, index)
 
 	// The worker pool in prepareMergeRequests has fully finished here. It must not overlap
@@ -438,6 +448,7 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 	// Registered before pushing so that partially pushed branches are also deleted.
 	// Cleanup must run after Ctrl-C too; deleteTemporaryBranches sets its own deadlines.
 	defer func() {
+		p.bar.setPhase("cleaning up", 0)
 		if err := p.deleteTemporaryBranches(ctx, ctx.Err() != nil); err != nil {
 			sendErr(fmt.Errorf("deleting temporary branches: %v", err))
 		}
@@ -453,13 +464,16 @@ func (p *project) migrateMergeRequests(ctx context.Context) {
 		return
 	}
 
+	p.bar.setPhase("writing pull requests", len(work))
 	for _, w := range work {
 		if err := ctx.Err(); err != nil {
 			sendErr(fmt.Errorf("migrating merge requests: %v", err))
 			return
 		}
 
-		if ok, err := p.writeMergeRequest(ctx, w, index); err != nil {
+		ok, err := p.writeMergeRequest(ctx, w, index)
+		p.bar.advance(1)
+		if err != nil {
 			sendErr(err)
 			failureCount++
 		} else if ok {
@@ -688,6 +702,7 @@ func (p *project) prepareMergeRequests(ctx context.Context, mergeRequests []*git
 					continue // drain the queue without starting new merge requests
 				}
 				work[i], errs[i] = p.safePrepareMergeRequest(ctx, mergeRequests[i], index)
+				p.bar.advance(1)
 			}
 		}()
 	}

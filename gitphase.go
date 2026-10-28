@@ -56,10 +56,13 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 	// Closed or merged merge requests often have their source branch deleted, so
 	// the commits are not reachable from any fetched branch. GitLab allows
 	// fetching them directly by SHA (AllowReachableSHA1InWant).
-	for _, shaChunk := range chunk(shas, fetchChunkSize) {
+	shaChunks := chunk(shas, fetchChunkSize)
+	p.bar.setPhase("fetching commits", len(shaChunks))
+	for _, shaChunk := range shaChunks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		p.bar.advance(1)
 		logger.Debug("fetching merge request commits by SHA", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", len(shaChunk))
 		if err := p.fetchCommitsBySHA(ctx, shaChunk); err != nil {
 			return fmt.Errorf("fetching merge request commits by SHA: %v", err)
@@ -125,10 +128,13 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 		}
 	}
 
-	for _, refSpecChunk := range chunk(refSpecs, pushChunkSize) {
+	refSpecChunks := chunk(refSpecs, pushChunkSize)
+	p.bar.setPhase("pushing temporary branches", len(refSpecChunks))
+	for _, refSpecChunk := range refSpecChunks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		p.bar.advance(1)
 		logger.Debug("pushing temporary branches", "owner", p.githubPath[0], "repo", p.githubPath[1], "count", len(refSpecChunk))
 		if err := p.repo.PushContext(ctx, &git.PushOptions{
 			RemoteName: "github",
