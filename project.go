@@ -115,7 +115,6 @@ func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted b
 		DefaultBranch: &p.defaultBranch,
 		Private:       pointer(true),
 		HasIssues:     pointer(true),
-		HasProjects:   pointer(true),
 		HasWiki:       pointer(true),
 	}
 	if _, _, err := gh.Repositories.Create(ctx, p.githubPath[0], &newRepo); err != nil {
