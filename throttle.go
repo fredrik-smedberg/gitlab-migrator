@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,29 +19,58 @@ import (
 // process-wide limits:
 //   - content-creating requests (POST, PATCH, PUT, DELETE) are spaced out by a rate limiter, to
 //     stay within GitHub's secondary rate limits (80 per minute, 500 per hour);
-//   - when GitHub answers 403 or 429 with a Retry-After header, all later requests, reads included,
-//     wait until that time has passed, since continuing to send requests while rate-limited risks a ban;
-//   - when a response says the primary rate limit is exhausted (X-Ratelimit-Remaining: 0), all later
-//     requests wait until X-Ratelimit-Reset plus a margin;
-//   - when a write is rate-limited (403 or 429 with Retry-After or X-Ratelimit-Remaining: 0), the
-//     write limiter rate is halved, down to minWritesPerHour, so a too high setting corrects itself.
+//   - a rate-limited response (429, or 403 with Retry-After, X-Ratelimit-Remaining: 0, or a
+//     "rate limit" message) pauses all later requests, reads included, until Retry-After or the
+//     reset time has passed, or for defaultRateLimitPause when GitHub gives no time, since
+//     continuing to send requests while rate-limited risks a ban;
+//   - the rate-limited request itself is sent again after the pause, as often as needed. A rate
+//     limit is a wait, never a failure, so the retry client's attempt budget is kept for real errors;
+//   - when a write is rate-limited, the write limiter rate is halved (at most once per
+//     rateLowerInterval, down to minWritesPerHour), so a too high setting corrects itself; after
+//     rateRecoverInterval without rate limits it is raised again step by step, up to the setting.
 //
 // The "github write" Debug line is logged per attempt, which is also what GitHub's rate limit counts.
 //
 // Only REST API calls go through this transport. Git pushes use go-git's own HTTP transport and are
 // not throttled here.
 type throttlingTransport struct {
-	base        http.RoundTripper
-	writes      *rate.Limiter
+	base   http.RoundTripper
+	writes *rate.Limiter
+	// configured is the write limit from the flag; the limiter never exceeds it.
+	configured rate.Limit
+
 	mu          sync.Mutex
 	pausedUntil time.Time
+	lastLimited time.Time // last time a write was rate-limited (or the limit lowered)
+	lastRaised  time.Time
 }
+
+const (
+	// minWritesPerHour is the floor for lowerWriteRate.
+	minWritesPerHour = 250
+	// rateLowerInterval is the shortest time between two halvings of the write limit, so a burst
+	// of rate-limited retries during one pause does not collapse the limit to the floor.
+	rateLowerInterval = 2 * time.Minute
+	// rateRecoverInterval is the time without rate limits after which the write limit is raised.
+	rateRecoverInterval = 10 * time.Minute
+	// rateRecoverFactor is applied at each raise.
+	rateRecoverFactor = 1.25
+	// rateLimitResetMargin is added to X-Ratelimit-Reset before requests resume.
+	rateLimitResetMargin = 30 * time.Second
+	// rateLimitBodyLimit is how much of a 403 body is read to look for a rate limit message.
+	rateLimitBodyLimit = 64 << 10
+)
+
+// defaultRateLimitPause is used when a rate-limited response gives no Retry-After or reset time.
+// GitHub's guidance is to wait at least one minute. A variable so tests can shorten it.
+var defaultRateLimitPause = time.Minute
 
 // newThrottlingTransport wraps base. writesPerHour <= 0 disables the write limiter.
 func newThrottlingTransport(base http.RoundTripper, writesPerHour int) *throttlingTransport {
 	t := &throttlingTransport{base: base}
 	if writesPerHour > 0 {
-		t.writes = rate.NewLimiter(rate.Every(time.Hour/time.Duration(writesPerHour)), 1)
+		t.configured = rate.Every(time.Hour / time.Duration(writesPerHour))
+		t.writes = rate.NewLimiter(t.configured, 1)
 	}
 	return t
 }
@@ -46,15 +78,30 @@ func newThrottlingTransport(base http.RoundTripper, writesPerHour int) *throttli
 func (t *throttlingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 
-	if err := t.waitForPause(ctx); err != nil {
-		return nil, err
-	}
-
 	isWrite := false
 	switch req.Method {
 	case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
 		isWrite = true
-		if t.writes != nil {
+	}
+
+	// Keep the body replayable so a rate-limited request can be sent again.
+	if req.Body != nil && req.Body != http.NoBody && req.GetBody == nil {
+		data, err := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		req = req.Clone(ctx)
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil }
+		req.Body, _ = req.GetBody()
+		req.ContentLength = int64(len(data))
+	}
+
+	for attempt := 1; ; attempt++ {
+		if err := t.waitForPause(ctx); err != nil {
+			return nil, err
+		}
+		if isWrite && t.writes != nil {
 			if err := t.writes.Wait(ctx); err != nil {
 				return nil, err
 			}
@@ -63,50 +110,110 @@ func (t *throttlingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 				return nil, err
 			}
 		}
-		logger.Debug("github write", "method", req.Method, "path", req.URL.Path)
-	}
+		if isWrite {
+			logger.Debug("github write", "method", req.Method, "path", req.URL.Path, "attempt", attempt)
+		}
 
-	resp, err := t.base.RoundTrip(req)
-	if err != nil || resp == nil {
-		return resp, err
-	}
+		resp, err := t.base.RoundTrip(req)
+		if err != nil || resp == nil {
+			return resp, err
+		}
 
-	rateLimited := resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests
-	if rateLimited && isWrite && (resp.Header.Get("Retry-After") != "" || resp.Header.Get("X-Ratelimit-Remaining") == "0") {
-		t.lowerWriteRate()
-	}
+		limited, until, reason := rateLimitInfo(resp)
+		if !limited {
+			if !until.IsZero() {
+				// The primary rate limit is exhausted although this request succeeded: wait for the reset.
+				t.pauseUntil(until)
+				logger.Warn("GitHub rate limit exhausted, pausing all GitHub API requests until reset", "until", until)
+			} else if isWrite {
+				t.maybeRaiseWriteRate()
+			}
+			return resp, nil
+		}
 
-	if rateLimited {
-		if seconds, perr := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64); perr == nil && seconds > 0 {
-			pause := time.Duration(seconds) * time.Second
-			t.pauseUntil(time.Now().Add(pause))
-			logger.Warn("GitHub rate limit hit, pausing all GitHub API requests", "status", resp.StatusCode, "pause", pause)
+		if until.IsZero() {
+			until = time.Now().Add(defaultRateLimitPause)
+		}
+		t.pauseUntil(until)
+		if isWrite {
+			t.lowerWriteRate()
+		}
+		logger.Warn("GitHub rate limit hit, pausing all GitHub API requests and retrying", "status", resp.StatusCode, "reason", reason, "method", req.Method, "path", req.URL.Path, "pause", time.Until(until).Round(time.Second), "attempt", attempt)
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		if req.Body != nil && req.Body != http.NoBody {
+			if req.GetBody == nil {
+				// Cannot replay the body; hand the response to the retry client instead.
+				return resp, nil
+			}
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			req = req.Clone(ctx)
+			req.Body = body
 		}
 	}
-
-	// The primary rate limit is exhausted: wait until it resets, with a margin for clock skew.
-	if resp.Header.Get("X-Ratelimit-Remaining") == "0" {
-		if reset, perr := strconv.ParseInt(resp.Header.Get("X-Ratelimit-Reset"), 10, 64); perr == nil && reset > 0 {
-			until := time.Unix(reset, 0).Add(rateLimitResetMargin)
-			t.pauseUntil(until)
-			logger.Warn("GitHub rate limit exhausted, pausing all GitHub API requests until reset", "status", resp.StatusCode, "until", until)
-		}
-	}
-
-	return resp, nil
 }
 
-// minWritesPerHour is the floor for lowerWriteRate.
-const minWritesPerHour = 100
+// rateLimitInfo reports whether resp is a rate-limited response, until when requests should
+// pause (zero when GitHub gave no time), and a short reason for the log. For a 403 the body is
+// inspected for a rate limit message and then restored. A successful response with
+// X-Ratelimit-Remaining: 0 is not limited but returns the reset time.
+func rateLimitInfo(resp *http.Response) (limited bool, until time.Time, reason string) {
+	retryAfter := resp.Header.Get("Retry-After")
+	remainingZero := resp.Header.Get("X-Ratelimit-Remaining") == "0"
+	if reset, err := strconv.ParseInt(resp.Header.Get("X-Ratelimit-Reset"), 10, 64); err == nil && reset > 0 && remainingZero {
+		until = time.Unix(reset, 0).Add(rateLimitResetMargin)
+	}
+	if seconds, err := strconv.ParseInt(retryAfter, 10, 64); err == nil && seconds > 0 {
+		until = time.Now().Add(time.Duration(seconds) * time.Second)
+	}
 
-// lowerWriteRate halves the write limiter rate, down to minWritesPerHour. It does nothing when
-// the write limiter is disabled.
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests:
+		return true, until, "429"
+	case http.StatusForbidden:
+		switch {
+		case retryAfter != "":
+			return true, until, "retry-after"
+		case remainingZero:
+			return true, until, "rate limit exhausted"
+		}
+		if resp.Body != nil {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, rateLimitBodyLimit))
+			rest, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), bytes.NewReader(rest)))
+			if strings.Contains(strings.ToLower(string(data)), "rate limit") {
+				msg := strings.Join(strings.Fields(string(data)), " ")
+				if len(msg) > 160 {
+					msg = msg[:160] + "…"
+				}
+				return true, until, msg
+			}
+		}
+	}
+	return false, until, ""
+}
+
+// lowerWriteRate halves the write limiter rate, down to minWritesPerHour, at most once per
+// rateLowerInterval. It does nothing when the write limiter is disabled.
 func (t *throttlingTransport) lowerWriteRate() {
 	if t.writes == nil {
 		return
 	}
 
 	t.mu.Lock()
+	now := time.Now()
+	if now.Sub(t.lastLimited) < rateLowerInterval {
+		t.lastLimited = now
+		t.mu.Unlock()
+		return
+	}
+	t.lastLimited = now
 	limit := t.writes.Limit() / 2
 	if floor := rate.Every(time.Hour / minWritesPerHour); limit < floor {
 		limit = floor
@@ -114,11 +221,35 @@ func (t *throttlingTransport) lowerWriteRate() {
 	t.writes.SetLimit(limit)
 	t.mu.Unlock()
 
-	logger.Warn("GitHub rate-limited a write, lowering the write limit", "writes_per_hour", int(math.Round(float64(limit)*3600)))
+	logger.Warn("GitHub rate-limited a write, lowering the write limit", "writes_per_hour", writesPerHour(limit))
 }
 
-// rateLimitResetMargin is added to X-Ratelimit-Reset before requests resume.
-const rateLimitResetMargin = 30 * time.Second
+// maybeRaiseWriteRate raises the write limit by rateRecoverFactor, up to the configured limit,
+// when no write has been rate-limited for rateRecoverInterval, at most once per interval.
+func (t *throttlingTransport) maybeRaiseWriteRate() {
+	if t.writes == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	limit := t.writes.Limit()
+	if limit >= t.configured {
+		return
+	}
+	now := time.Now()
+	if now.Sub(t.lastLimited) < rateRecoverInterval || now.Sub(t.lastRaised) < rateRecoverInterval {
+		return
+	}
+	limit = rate.Limit(math.Min(float64(limit)*rateRecoverFactor, float64(t.configured)))
+	t.writes.SetLimit(limit)
+	t.lastRaised = now
+	logger.Info("no GitHub rate limits for a while, raising the write limit", "writes_per_hour", writesPerHour(limit))
+}
+
+func writesPerHour(limit rate.Limit) int {
+	return int(math.Round(float64(limit) * 3600))
+}
 
 // pauseUntil pauses all requests until the given time. An existing longer pause is kept.
 func (t *throttlingTransport) pauseUntil(until time.Time) {

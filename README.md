@@ -147,7 +147,7 @@ By default, 4 workers will be spawned to migrate up to 4 projects in parallel. Y
 Within a project, merge requests are read from GitLab in parallel, while git operations and GitHub writes run serially:
 
 - `-merge-request-concurrency` sets how many merge requests per project are read from GitLab in parallel (default 4).
-- `-github-writes-per-hour` sets the maximum content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour, across all projects; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes. Each rate-limited write halves the limit, down to 100 per hour. When GitHub reports a rate limit, all GitHub API requests pause until it has passed.
+- `-github-writes-per-hour` sets the maximum content-creating GitHub API requests (POST, PATCH, PUT, DELETE) per hour, across all projects; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes. A rate-limited write halves the limit (at most once per two minutes, down to 250 per hour); after ten minutes without rate limits the limit is raised again step by step, up to the configured value. When GitHub reports a rate limit, all GitHub API requests pause until it has passed (one minute when GitHub gives no time), and the rate-limited request is sent again after the pause, as often as needed. A rate limit is a wait, never a failure.
 
 GitHub writes are therefore the bottleneck for projects with many merge requests, and more workers will not speed them up.
 

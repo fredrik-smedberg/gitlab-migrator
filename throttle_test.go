@@ -76,7 +76,7 @@ func TestWritesAreRateLimited(t *testing.T) {
 	}
 }
 
-func TestRetryAfterPausesAllRequests(t *testing.T) {
+func TestRetryAfterPausesAllRequestsAndRetries(t *testing.T) {
 	ensureTestLogger()
 	var calls atomic.Int32
 	stub := roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -93,17 +93,92 @@ func TestRetryAfterPausesAllRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("first call status %d, want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 from the retried request", resp.StatusCode)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("%d calls, want 2 (rate-limited attempt plus retry)", calls.Load())
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatalf("retry after Retry-After: 1 happened after %v, want >= 900ms", elapsed)
 	}
 
+	// Later requests, reads included, are not delayed any more once the pause has passed.
+	start = time.Now()
 	resp, err = tr.RoundTrip(newTestRequest(t, http.MethodGet))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
-		t.Fatalf("GET after Retry-After: 1 started after %v, want >= 900ms", elapsed)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("GET after the pause took %v", elapsed)
+	}
+}
+
+func TestRateLimitMessageWithoutRetryAfterPausesDefault(t *testing.T) {
+	ensureTestLogger()
+	defer func(d time.Duration) { defaultRateLimitPause = d }(defaultRateLimitPause)
+	defaultRateLimitPause = 300 * time.Millisecond
+
+	var calls atomic.Int32
+	var bodies []string
+	stub := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(req.Body)
+		bodies = append(bodies, string(b))
+		if calls.Add(1) == 1 {
+			resp := okResponse(http.StatusForbidden, nil)
+			resp.Body = io.NopCloser(strings.NewReader(`{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`))
+			return resp, nil
+		}
+		return okResponse(http.StatusCreated, nil), nil
+	})
+	tr := newThrottlingTransport(stub, 0)
+
+	req, err := http.NewRequest(http.MethodPost, "https://api.github.com/repos/o/r/issues/1/comments", strings.NewReader(`{"body":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d, want 201", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("retry happened after %v, want >= 250ms (default pause)", elapsed)
+	}
+	if len(bodies) != 2 || bodies[0] != bodies[1] || bodies[1] != `{"body":"hi"}` {
+		t.Fatalf("request body must be replayed on retry, got %q", bodies)
+	}
+}
+
+func TestNonRateLimit403IsReturned(t *testing.T) {
+	ensureTestLogger()
+	var calls atomic.Int32
+	stub := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		resp := okResponse(http.StatusForbidden, nil)
+		resp.Body = io.NopCloser(strings.NewReader(`{"message":"Resource not accessible by personal access token"}`))
+		return resp, nil
+	})
+	tr := newThrottlingTransport(stub, 0)
+	resp, err := tr.RoundTrip(newTestRequest(t, http.MethodPost))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || calls.Load() != 1 {
+		t.Fatalf("status %d calls %d, want the 403 returned once", resp.StatusCode, calls.Load())
+	}
+	if !strings.Contains(string(body), "Resource not accessible") {
+		t.Fatalf("body must be restored after inspection, got %q", body)
+	}
+	if !tr.pausedUntil.IsZero() {
+		t.Fatalf("a permission 403 must not pause requests")
 	}
 }
 
@@ -202,10 +277,14 @@ func TestPauseSetDuringWriteWaitIsHonoured(t *testing.T) {
 	}
 }
 
-func TestRateLimitedWriteLowersWriteLimit(t *testing.T) {
+func TestRateLimitedWriteLowersWriteLimitOncePerInterval(t *testing.T) {
 	ensureTestLogger()
+	var calls atomic.Int32
 	stub := roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return okResponse(http.StatusForbidden, http.Header{"Retry-After": []string{"1"}}), nil
+		if n := calls.Add(1); n == 1 || n == 2 {
+			return okResponse(http.StatusForbidden, http.Header{"Retry-After": []string{"1"}}), nil
+		}
+		return okResponse(http.StatusOK, nil), nil
 	})
 	tr := newThrottlingTransport(stub, 3600)
 	before := tr.writes.Limit()
@@ -215,16 +294,26 @@ func TestRateLimitedWriteLowersWriteLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-
+	if calls.Load() != 3 {
+		t.Fatalf("%d calls, want 3 (two rate-limited attempts, then success)", calls.Load())
+	}
+	// Two rate-limited attempts within rateLowerInterval halve the limit once, not twice.
 	if got, want := tr.writes.Limit(), before/2; math.Abs(float64(got-want)) > 1e-9 {
 		t.Fatalf("write limit after rate-limited POST = %v, want %v", got, want)
 	}
 
-	// A rate-limited read leaves the write limit alone. Its Retry-After pause is not waited for
-	// here; the request below would wait one second for the pause set above.
+	// A rate-limited read leaves the write limit alone.
+	calls.Store(0)
 	tr.mu.Lock()
 	tr.pausedUntil = time.Time{}
 	tr.mu.Unlock()
+	stub2 := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return okResponse(http.StatusTooManyRequests, http.Header{"Retry-After": []string{"1"}}), nil
+		}
+		return okResponse(http.StatusOK, nil), nil
+	})
+	tr.base = stub2
 	resp, err = tr.RoundTrip(newTestRequest(t, http.MethodGet))
 	if err != nil {
 		t.Fatal(err)
@@ -235,10 +324,52 @@ func TestRateLimitedWriteLowersWriteLimit(t *testing.T) {
 	}
 }
 
+func TestWriteRateRecoversAfterQuietPeriod(t *testing.T) {
+	ensureTestLogger()
+	stub := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return okResponse(http.StatusOK, nil), nil
+	})
+	tr := newThrottlingTransport(stub, 36000) // ten per second, so the test is quick
+	tr.writes.SetLimit(tr.configured / 4)
+	lowered := tr.writes.Limit()
+
+	// Recently limited: no raise.
+	tr.lastLimited = time.Now()
+	resp, _ := tr.RoundTrip(newTestRequest(t, http.MethodPost))
+	_ = resp.Body.Close()
+	if tr.writes.Limit() != lowered {
+		t.Fatalf("limit raised too early")
+	}
+
+	// Quiet for longer than rateRecoverInterval: raised by rateRecoverFactor, once per interval.
+	tr.lastLimited = time.Now().Add(-2 * rateRecoverInterval)
+	tr.lastRaised = time.Time{}
+	resp, _ = tr.RoundTrip(newTestRequest(t, http.MethodPost))
+	_ = resp.Body.Close()
+	if got, want := tr.writes.Limit(), lowered*rateRecoverFactor; math.Abs(float64(got-want)) > 1e-9 {
+		t.Fatalf("limit after quiet period = %v, want %v", got, want)
+	}
+	resp, _ = tr.RoundTrip(newTestRequest(t, http.MethodPost))
+	_ = resp.Body.Close()
+	if got, want := tr.writes.Limit(), lowered*rateRecoverFactor; math.Abs(float64(got-want)) > 1e-9 {
+		t.Fatalf("limit raised twice within one interval: %v", got)
+	}
+
+	// Never above the configured limit.
+	tr.writes.SetLimit(tr.configured / 1.1)
+	tr.lastRaised = time.Time{}
+	resp, _ = tr.RoundTrip(newTestRequest(t, http.MethodPost))
+	_ = resp.Body.Close()
+	if tr.writes.Limit() > tr.configured {
+		t.Fatalf("limit %v exceeds configured %v", tr.writes.Limit(), tr.configured)
+	}
+}
+
 func TestWriteLimitFloor(t *testing.T) {
 	ensureTestLogger()
 	tr := newThrottlingTransport(roundTripFunc(nil), 150)
 	tr.lowerWriteRate()
+	tr.lastLimited = time.Time{}
 	tr.lowerWriteRate()
 	if got, want := tr.writes.Limit(), rate.Every(time.Hour/minWritesPerHour); math.Abs(float64(got-want)) > 1e-12 {
 		t.Fatalf("write limit = %v, want floor %v", got, want)
