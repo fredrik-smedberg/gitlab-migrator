@@ -80,6 +80,7 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 	}()
 
 	var refSpecs []config.RefSpec
+	workByRef := make(map[string]*mrWork) // temporary branch name -> merge request, for rejected pushes
 	for _, w := range work {
 		if !w.needsBranch || w.skip != "" {
 			continue
@@ -125,6 +126,7 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 			}
 			refs = append(refs, ref)
 			refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", ref)))
+			workByRef[branch.name] = w
 		}
 	}
 
@@ -136,12 +138,29 @@ func (p *project) pushTemporaryBranches(ctx context.Context, work []*mrWork) err
 		}
 		p.bar.advance(1)
 		logger.Debug("pushing temporary branches", "owner", p.githubPath[0], "repo", p.githubPath[1], "count", len(refSpecChunk))
-		if err := p.repo.PushContext(ctx, &git.PushOptions{
-			RemoteName: "github",
-			RefSpecs:   refSpecChunk,
-			Force:      true,
-		}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		// A rejected ref (for example a file over 100 MB in a merge request) refuses the whole
+		// push, so isolate the rejected refs and skip their merge requests instead of failing.
+		rejected, err := isolateRejected(refSpecChunk, func(rs []config.RefSpec) error {
+			err := p.repo.PushContext(ctx, &git.PushOptions{
+				RemoteName: "github",
+				RefSpecs:   rs,
+				Force:      true,
+				Progress:   newRemoteMessageLogger("owner", p.githubPath[0], "repo", p.githubPath[1]),
+			})
+			if errors.Is(err, git.NoErrAlreadyUpToDate) {
+				return nil
+			}
+			return err
+		})
+		if err != nil {
 			return fmt.Errorf("pushing temporary branches to github: %v", err)
+		}
+		for _, rs := range rejected {
+			branch := strings.TrimPrefix(rs.Src(), "refs/heads/")
+			if w := workByRef[branch]; w != nil && w.skip == "" {
+				w.skip = fmt.Sprintf("branch %s rejected by GitHub (see 'message from git server' warnings)", branch)
+				logger.Warn("skipping merge request as GitHub rejected its temporary branch", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "merge_request_id", w.mr.IID, "branch", branch)
+			}
 		}
 	}
 

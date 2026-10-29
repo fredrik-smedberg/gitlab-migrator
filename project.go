@@ -99,6 +99,10 @@ type project struct {
 	gitlabPath    []string
 	githubPath    []string
 	bar           *progressBar // nil when progress is disabled
+
+	// rejectedBranches holds branch names GitHub refused to accept (for example GH001,
+	// a file over 100 MB). Written before the merge request phases, read by the workers.
+	rejectedBranches map[string]bool
 }
 
 func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted bool) error {
@@ -250,17 +254,35 @@ func (p *project) migrate(ctx context.Context) (err error) {
 
 	logger.Debug("force-pushing branches to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
 	p.bar.setPhase("pushing branches", 0)
-	if err = p.repo.PushContext(ctx, &git.PushOptions{
-		RemoteName: "github",
-		Force:      true,
-		RefSpecs:   refSpecs,
-		//Prune:      true, // causes error, attempts to delete main branch
-	}); err != nil {
+	// GitHub refuses the whole push when any branch is rejected, for example for a file over
+	// 100 MB (GH001). Isolate the rejected branches and push the rest, so that one branch does
+	// not block the migration of the project.
+	rejected, err := isolateRejected(refSpecs, func(rs []config.RefSpec) error {
+		err := p.repo.PushContext(ctx, &git.PushOptions{
+			RemoteName: "github",
+			Force:      true,
+			RefSpecs:   rs,
+			Progress:   newRemoteMessageLogger("owner", p.githubPath[0], "repo", p.githubPath[1]),
+			//Prune:      true, // causes error, attempts to delete main branch
+		})
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
 			logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-		} else {
-			return fmt.Errorf("pushing to github repo: %v", err)
+			return nil
 		}
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("pushing to github repo: %v", err)
+	}
+	if len(rejected) > 0 {
+		names := make([]string, 0, len(rejected))
+		p.rejectedBranches = make(map[string]bool, len(rejected))
+		for _, rs := range rejected {
+			name := strings.TrimPrefix(rs.Src(), "refs/heads/")
+			names = append(names, name)
+			p.rejectedBranches[name] = true
+		}
+		sendErr(fmt.Errorf("%d branch(es) rejected by GitHub and not migrated for %s/%s (see 'message from git server' warnings above): %v", len(names), p.gitlabPath[0], p.gitlabPath[1], names))
 	}
 
 	if trimGithubBranches {
@@ -745,6 +767,10 @@ func (p *project) prepareMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	}
 
 	if strings.EqualFold(mergeRequest.State, "opened") {
+		if p.rejectedBranches[mergeRequest.SourceBranch] {
+			w.skip = fmt.Sprintf("source branch %s was rejected by GitHub (see 'message from git server' warnings)", mergeRequest.SourceBranch)
+			return w, nil
+		}
 		if _, err := p.repo.Reference(plumbing.NewBranchReferenceName(mergeRequest.SourceBranch), false); err != nil {
 			if errors.Is(err, plumbing.ErrReferenceNotFound) && skipInvalidMergeRequests {
 				w.skip = fmt.Sprintf("source branch %s does not exist", mergeRequest.SourceBranch)
