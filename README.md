@@ -151,6 +151,8 @@ Within a project, merge requests are read from GitLab in parallel, while git ope
 
 GitHub writes are therefore the bottleneck for projects with many merge requests, and more workers will not speed them up.
 
+If GitHub rejects a branch, for example because it contains a file over 100 MB (GH001), the rejected branches are reported and skipped, and the rest of the project is migrated. The server's own message is logged as a warning ("message from git server"). A merge request whose temporary branch is rejected is skipped the same way.
+
 When stderr is a terminal, a live progress bar per project shows the current phase, progress, rate, ETA and elapsed time, with log lines printed above it. Pass `-no-progress` to turn it off; it is off automatically when output is redirected. See [GitHub API docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) for details.
 
 Specify `-loop` to continue migrating projects until canceled. This is useful for daemonizing the migration tool, or automatically restarting when migrating a large number of projects (or a small number of very large projects).
