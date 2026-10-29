@@ -1007,6 +1007,7 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 	prComments := index.comments[pullRequest.GetNumber()]
 	logger.Info("migrating merge request comments from GitLab to GitHub", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(comments))
 
+	commentErrors := 0
 	for _, comment := range comments {
 		if comment == nil || comment.System {
 			continue
@@ -1050,7 +1051,9 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 					logger.Debug("updating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
 					prComment.Body = &commentBody
 					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
-						return false, fmt.Errorf("updating pull request comments: %v", err)
+						// Keep going with the other comments; a rerun retries this one.
+						sendErr(fmt.Errorf("updating pull request comment for note %d on pull request %d: %v", comment.ID, pullRequest.GetNumber(), err))
+						commentErrors++
 					}
 				}
 			} else {
@@ -1064,8 +1067,13 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 				Body: &commentBody,
 			}
 			if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
-				return false, fmt.Errorf("creating pull request comment: %v", err)
+				// Keep going with the other comments; a rerun creates this one.
+				sendErr(fmt.Errorf("creating pull request comment for note %d on pull request %d: %v", comment.ID, pullRequest.GetNumber(), err))
+				commentErrors++
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("migrating pull request comments: %v", err)
 		}
 	}
 
@@ -1102,6 +1110,10 @@ func (p *project) writeMergeRequest(ctx context.Context, w *mrWork, index *githu
 				return false, fmt.Errorf("creating merge request final comment: %v", err)
 			}
 		}
+	}
+
+	if commentErrors > 0 {
+		return false, fmt.Errorf("%d comment(s) on pull request %d could not be migrated; rerun to retry them", commentErrors, pullRequest.GetNumber())
 	}
 
 	return true, nil
