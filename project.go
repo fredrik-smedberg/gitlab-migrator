@@ -252,6 +252,23 @@ func (p *project) migrate(ctx context.Context) (err error) {
 		return fmt.Errorf("parsing branches: %v", err)
 	}
 
+	// A branch that has moved on GitHub since the last run, for example main after pull
+	// requests were merged there, holds commits GitLab does not have. Force-pushing the
+	// GitLab tip would drop them, so such branches are left as they are on GitHub.
+	if !overwriteDivergedBranches {
+		githubTips, err := githubBranchTips(ctx, p.repo)
+		if err != nil {
+			return err
+		}
+		var diverged []divergedBranch
+		if refSpecs, diverged, err = splitDiverged(p.repo, refSpecs, githubTips); err != nil {
+			return fmt.Errorf("comparing branches with github repo: %v", err)
+		}
+		for _, branch := range diverged {
+			logger.Warn("branch has commits on GitHub that GitLab lacks, not overwriting it (pass -overwrite-diverged-branches to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip, "gitlab_sha", branch.GitlabTip)
+		}
+	}
+
 	logger.Debug("force-pushing branches to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
 	p.bar.setPhase("pushing branches", 0)
 	// GitHub refuses the whole push when any branch is rejected, for example for a file over

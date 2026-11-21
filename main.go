@@ -36,7 +36,7 @@ const (
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noProgress, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
+var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noProgress, noPrompt, overwriteDivergedBranches, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabScheme, gitlabToken, projectsCsvPath, renameTrunkBranch string
 var gitlabCAFile string
 var gitlabCABundle []byte
@@ -122,6 +122,7 @@ func main() {
 	flag.BoolVar(&noPrompt, "no-prompt", false, "skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs")
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
+	flag.BoolVar(&overwriteDivergedBranches, "overwrite-diverged-branches", false, "when true, force-push every GitLab branch even when the branch on GitHub has commits that GitLab lacks; by default such branches are left untouched on GitHub and a warning is logged")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
 	flag.BoolVar(&showVersion, "version", false, "output version information")
 
