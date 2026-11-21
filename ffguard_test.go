@@ -147,3 +147,36 @@ func TestSplitDivergedWithoutGithubTips(t *testing.T) {
 		t.Errorf("push = %v, diverged = %v, want everything pushed", push, diverged)
 	}
 }
+
+func TestSplitMovedTags(t *testing.T) {
+	repo := newGuardTestRepo(t)
+	base := guardTestCommit(t, repo, "base")
+	next := guardTestCommit(t, repo, "next", base)
+
+	tags := []*plumbing.Reference{
+		plumbing.NewHashReference(plumbing.NewTagReferenceName("1.0.0"), base), // same on GitHub
+		plumbing.NewHashReference(plumbing.NewTagReferenceName("1.1.0"), next), // not on GitHub yet
+		plumbing.NewHashReference(plumbing.NewTagReferenceName("1.2.0"), base), // points elsewhere on GitHub
+	}
+	githubTips := map[string]plumbing.Hash{
+		"refs/tags/1.0.0":       base,
+		"refs/tags/1.2.0":       next,
+		"refs/tags/github-only": next, // not on GitLab: never part of the push
+		"refs/heads/1.1.0":      base, // a branch of the same name is not a tag
+	}
+
+	push, moved := splitMovedTags(tags, githubTips)
+
+	wantPush := []config.RefSpec{
+		"refs/tags/1.0.0:refs/tags/1.0.0",
+		"refs/tags/1.1.0:refs/tags/1.1.0",
+	}
+	if !reflect.DeepEqual(push, wantPush) {
+		t.Errorf("push = %v, want %v", push, wantPush)
+	}
+
+	wantMoved := []divergedBranch{{Name: "1.2.0", GithubTip: next, GitlabTip: base}}
+	if !reflect.DeepEqual(moved, wantMoved) {
+		t.Errorf("moved = %v, want %v", moved, wantMoved)
+	}
+}

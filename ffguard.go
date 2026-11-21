@@ -83,10 +83,30 @@ func splitDiverged(repo *git.Repository, refSpecs []config.RefSpec, githubTips m
 	return push, diverged, nil
 }
 
-// githubBranchTips lists the branch tips of the "github" remote in one call.
-// The REST branch listing is paginated and cached, which is no base for
-// deciding what a force-push may overwrite.
-func githubBranchTips(ctx context.Context, repo *git.Repository) (map[string]plumbing.Hash, error) {
+// splitMovedTags separates the tags that can be pushed to GitHub from those
+// that already exist there on another object, for example a tag that was
+// re-created on GitHub and has a release. githubTips maps full reference names
+// (refs/tags/...) to the objects the tags point at on GitHub.
+func splitMovedTags(tags []*plumbing.Reference, githubTips map[string]plumbing.Hash) ([]config.RefSpec, []divergedBranch) {
+	push := make([]config.RefSpec, 0, len(tags))
+	var moved []divergedBranch
+
+	for _, tag := range tags {
+		githubTip, onGithub := githubTips[tag.Name().String()]
+		if onGithub && githubTip != tag.Hash() {
+			moved = append(moved, divergedBranch{Name: tag.Name().Short(), GithubTip: githubTip, GitlabTip: tag.Hash()})
+			continue
+		}
+		push = append(push, config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", tag.Name())))
+	}
+
+	return push, moved
+}
+
+// githubRefTips lists the branches and tags of the "github" remote in one
+// call, keyed by full reference name. The REST branch listing is paginated
+// and cached, which is no base for deciding what a force-push may overwrite.
+func githubRefTips(ctx context.Context, repo *git.Repository) (map[string]plumbing.Hash, error) {
 	remote, err := repo.Remote("github")
 	if err != nil {
 		return nil, fmt.Errorf("looking up github remote: %v", err)
@@ -102,7 +122,7 @@ func githubBranchTips(ctx context.Context, repo *git.Repository) (map[string]plu
 
 	tips := make(map[string]plumbing.Hash)
 	for _, ref := range refs {
-		if ref.Type() == plumbing.HashReference && ref.Name().IsBranch() {
+		if ref.Type() == plumbing.HashReference && (ref.Name().IsBranch() || ref.Name().IsTag()) {
 			tips[ref.Name().String()] = ref.Hash()
 		}
 	}

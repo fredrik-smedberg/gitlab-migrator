@@ -255,9 +255,9 @@ func (p *project) migrate(ctx context.Context) (err error) {
 	// A branch that has moved on GitHub since the last run, for example main after pull
 	// requests were merged there, holds commits GitLab does not have. Force-pushing the
 	// GitLab tip would drop them, so such branches are left as they are on GitHub.
+	var githubTips map[string]plumbing.Hash
 	if !overwriteDivergedBranches {
-		githubTips, err := githubBranchTips(ctx, p.repo)
-		if err != nil {
+		if githubTips, err = githubRefTips(ctx, p.repo); err != nil {
 			return err
 		}
 		var diverged []divergedBranch
@@ -339,10 +339,32 @@ func (p *project) migrate(ctx context.Context) (err error) {
 
 	logger.Debug("force-pushing tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
 	p.bar.setPhase("pushing tags", 0)
-	if err = p.repo.PushContext(ctx, &git.PushOptions{
+	tagRefSpecs := []config.RefSpec{"refs/tags/*:refs/tags/*"}
+	if !overwriteDivergedBranches {
+		// A tag that points at another object on GitHub is left alone, like a diverged branch.
+		tagIter, err := p.repo.Tags()
+		if err != nil {
+			return fmt.Errorf("retrieving tags: %v", err)
+		}
+		var tags []*plumbing.Reference
+		if err = tagIter.ForEach(func(ref *plumbing.Reference) error {
+			tags = append(tags, ref)
+			return nil
+		}); err != nil {
+			return fmt.Errorf("parsing tags: %v", err)
+		}
+		var moved []divergedBranch
+		tagRefSpecs, moved = splitMovedTags(tags, githubTips)
+		for _, tag := range moved {
+			logger.Warn("tag points at another object on GitHub, not overwriting it (pass -overwrite-diverged-branches to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "tag", tag.Name, "github_sha", tag.GithubTip, "gitlab_sha", tag.GitlabTip)
+		}
+	}
+	if len(tagRefSpecs) == 0 {
+		logger.Debug("no tags to push to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+	} else if err = p.repo.PushContext(ctx, &git.PushOptions{
 		RemoteName: "github",
 		Force:      true,
-		RefSpecs:   []config.RefSpec{"refs/tags/*:refs/tags/*"},
+		RefSpecs:   tagRefSpecs,
 	}); err != nil {
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
 			logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)

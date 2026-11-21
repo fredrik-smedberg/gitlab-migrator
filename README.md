@@ -66,7 +66,7 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -no-prompt
         skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs
   -overwrite-diverged-branches
-        when true, force-push every GitLab branch even when the branch on GitHub has commits that GitLab lacks; by default such branches are left untouched on GitHub and a warning is logged
+        when true, force-push every GitLab branch and tag even when the branch on GitHub has commits that GitLab lacks or the tag points elsewhere; by default those are left untouched on GitHub and a warning is logged
   -projects-csv string
         specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)
   -rename-master-to-main
@@ -78,7 +78,7 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -skip-invalid-merge-requests
         when true, will log and skip invalid merge requests instead of raising an error
   -trim-branches-on-github
-        when true, will delete any branches on GitHub that are no longer present in GitLab
+        when true, will delete any branches on GitHub that are no longer present in GitLab, including branches created on GitHub after the migration
   -version
         output version information
 ```
