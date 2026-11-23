@@ -78,7 +78,7 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -skip-invalid-merge-requests
         when true, will log and skip invalid merge requests instead of raising an error
   -trim-branches-on-github
-        when true, will delete any branches on GitHub that are no longer present in GitLab, including branches created on GitHub after the migration
+        when true, will delete branches on GitHub that are no longer present in GitLab; a branch whose tip GitLab does not have (for example a pull request branch created on GitHub) is kept with a warning unless -overwrite-diverged-refs is set
   -version
         output version information
 ```

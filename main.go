@@ -123,7 +123,7 @@ func main() {
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&overwriteDivergedRefs, "overwrite-diverged-refs", false, "when true, force-push every GitLab branch and tag even when a branch on GitHub has commits that GitLab lacks or a tag points elsewhere; by default those are left untouched on GitHub and a warning is logged")
-	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab, including branches created on GitHub after the migration")
+	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete branches on GitHub that are no longer present in GitLab; a branch whose tip GitLab does not have (for example a pull request branch created on GitHub) is kept with a warning unless -overwrite-diverged-refs is set")
 	flag.BoolVar(&showVersion, "version", false, "output version information")
 
 	flag.StringVar(&githubDomain, "github-domain", defaultGithubDomain, "specifies the GitHub domain to use")

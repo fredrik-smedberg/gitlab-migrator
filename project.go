@@ -208,19 +208,9 @@ func (p *project) migrate(ctx context.Context) (err error) {
 	}
 
 	if p.defaultBranch != p.project.DefaultBranch {
-		if gitlabTrunk, err := p.repo.Reference(plumbing.NewBranchReferenceName(p.project.DefaultBranch), false); err == nil {
-			logger.Info("renaming trunk branch prior to push", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "gitlab_trunk", p.project.DefaultBranch, "github_trunk", p.defaultBranch, "sha", gitlabTrunk.Hash())
-
-			logger.Debug("creating new trunk branch", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "github_trunk", p.defaultBranch, "sha", gitlabTrunk.Hash())
-			githubTrunk := plumbing.NewHashReference(plumbing.NewBranchReferenceName(p.defaultBranch), gitlabTrunk.Hash())
-			if err = p.repo.Storer.SetReference(githubTrunk); err != nil {
-				return fmt.Errorf("creating trunk branch: %v", err)
-			}
-
-			logger.Debug("deleting old trunk branch", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "gitlab_trunk", p.project.DefaultBranch, "sha", gitlabTrunk.Hash())
-			if err = p.repo.Storer.RemoveReference(gitlabTrunk.Name()); err != nil {
-				return fmt.Errorf("deleting old trunk branch: %v", err)
-			}
+		logger.Info("renaming trunk branch prior to push", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "gitlab_trunk", p.project.DefaultBranch, "github_trunk", p.defaultBranch)
+		if err = renameTrunkRef(p.repo, p.project.DefaultBranch, p.defaultBranch); err != nil {
+			return fmt.Errorf("renaming trunk branch: %v", err)
 		}
 	}
 
@@ -236,141 +226,34 @@ func (p *project) migrate(ctx context.Context) (err error) {
 		return fmt.Errorf("adding github remote: %v", err)
 	}
 
-	logger.Debug("determining branches to push", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-	branches, err := p.repo.Branches()
-	if err != nil {
-		return fmt.Errorf("retrieving branches: %v", err)
-	}
-
-	gitlabBranches := make([]string, 0)
-	refSpecs := make([]config.RefSpec, 0)
-	if err = branches.ForEach(func(ref *plumbing.Reference) error {
-		gitlabBranches = append(gitlabBranches, ref.Name().Short())
-		refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", ref.Name())))
-		return nil
-	}); err != nil {
-		return fmt.Errorf("parsing branches: %v", err)
-	}
-
-	// A branch that has moved on GitHub since the last run, for example main after pull
-	// requests were merged there, holds commits GitLab does not have. Force-pushing the
-	// GitLab tip would drop them, so such branches are left as they are on GitHub.
-	var githubTips map[string]plumbing.Hash
-	if !overwriteDivergedRefs {
-		if githubTips, err = githubRefTips(ctx, p.repo); err != nil {
-			return err
-		}
-		var diverged []divergedRef
-		if refSpecs, diverged, err = splitDiverged(p.repo, refSpecs, githubTips); err != nil {
-			return fmt.Errorf("comparing branches with github repo: %v", err)
-		}
-		for _, branch := range diverged {
-			logger.Warn("branch has commits on GitHub that GitLab lacks, not overwriting it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip, "gitlab_sha", branch.GitlabTip)
-		}
-	}
-
-	logger.Debug("force-pushing branches to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
-	p.bar.setPhase("pushing branches", 0)
-	// GitHub refuses the whole push when any branch is rejected, for example for a file over
-	// 100 MB (GH001). Isolate the rejected branches and push the rest, so that one branch does
-	// not block the migration of the project.
-	rejected, err := isolateRejected(refSpecs, func(rs []config.RefSpec) error {
-		err := p.repo.PushContext(ctx, &git.PushOptions{
-			RemoteName: "github",
-			Force:      true,
-			RefSpecs:   rs,
-			Progress:   newRemoteMessageLogger("owner", p.githubPath[0], "repo", p.githubPath[1]),
-			//Prune:      true, // causes error, attempts to delete main branch
-		})
-		if errors.Is(err, git.NoErrAlreadyUpToDate) {
-			logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-			return nil
-		}
-		return err
+	logger.Debug("pushing branches and tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+	result, err := pushToGithub(ctx, p.repo, pushOptions{
+		overwrite: overwriteDivergedRefs,
+		trim:      trimGithubBranches,
+		progress:  newRemoteMessageLogger("owner", p.githubPath[0], "repo", p.githubPath[1]),
+		phase:     func(name string) { p.bar.setPhase(name, 0) },
 	})
 	if err != nil {
-		return fmt.Errorf("pushing to github repo: %v", err)
+		return err
 	}
-	if len(rejected) > 0 {
-		names := make([]string, 0, len(rejected))
-		p.rejectedBranches = make(map[string]bool, len(rejected))
-		for _, rs := range rejected {
+	for _, branch := range result.SkippedBranches {
+		logger.Warn("branch has commits on GitHub that GitLab lacks, not overwriting it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip, "gitlab_sha", branch.GitlabTip)
+	}
+	for _, tag := range result.SkippedTags {
+		logger.Warn("tag points at another object on GitHub, not overwriting it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "tag", tag.Name, "github_sha", tag.GithubTip, "gitlab_sha", tag.GitlabTip)
+	}
+	for _, branch := range result.KeptBranches {
+		logger.Warn("branch exists only on GitHub, not trimming it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip)
+	}
+	if len(result.Rejected) > 0 {
+		names := make([]string, 0, len(result.Rejected))
+		p.rejectedBranches = make(map[string]bool, len(result.Rejected))
+		for _, rs := range result.Rejected {
 			name := strings.TrimPrefix(rs.Src(), "refs/heads/")
 			names = append(names, name)
 			p.rejectedBranches[name] = true
 		}
 		sendErr(fmt.Errorf("%d branch(es) rejected by GitHub and not migrated for %s/%s (see 'message from git server' warnings above): %v", len(names), p.gitlabPath[0], p.gitlabPath[1], names))
-	}
-
-	if trimGithubBranches {
-		logger.Debug("determining old branches to trim on GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-		refSpecsToDelete := make([]config.RefSpec, 0)
-		githubBranches, err := getGithubBranches(ctx, p.githubPath[0], p.githubPath[1])
-		if err != nil {
-			return fmt.Errorf("listing branches from GitHub: %v", err)
-		}
-		for _, githubBranch := range githubBranches {
-			found := false
-			for _, gitlabBranch := range gitlabBranches {
-				if githubBranch.Name != nil && *githubBranch.Name == gitlabBranch {
-					found = true
-					break
-				}
-			}
-			if !found {
-				refSpecsToDelete = append(refSpecsToDelete, config.RefSpec(fmt.Sprintf(":refs/heads/%s", *githubBranch.Name)))
-			}
-		}
-
-		logger.Debug("trimming old branches on GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
-		if err = p.repo.PushContext(ctx, &git.PushOptions{
-			RemoteName: "github",
-			Force:      true,
-			RefSpecs:   refSpecsToDelete,
-			//Prune:      true, // causes error, attempts to delete main branch
-		}); err != nil {
-			if errors.Is(err, git.NoErrAlreadyUpToDate) {
-				logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-			} else {
-				return fmt.Errorf("pushing to github repo: %v", err)
-			}
-		}
-	}
-
-	logger.Debug("force-pushing tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-	p.bar.setPhase("pushing tags", 0)
-	tagRefSpecs := []config.RefSpec{"refs/tags/*:refs/tags/*"}
-	if !overwriteDivergedRefs {
-		// A tag that points at another object on GitHub is left alone, like a diverged branch.
-		tagIter, err := p.repo.Tags()
-		if err != nil {
-			return fmt.Errorf("retrieving tags: %v", err)
-		}
-		var tags []*plumbing.Reference
-		if err = tagIter.ForEach(func(ref *plumbing.Reference) error {
-			tags = append(tags, ref)
-			return nil
-		}); err != nil {
-			return fmt.Errorf("parsing tags: %v", err)
-		}
-		var moved []divergedRef
-		tagRefSpecs, moved = splitMovedTags(tags, githubTips)
-		for _, tag := range moved {
-			logger.Warn("tag points at another object on GitHub, not overwriting it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "tag", tag.Name, "github_sha", tag.GithubTip, "gitlab_sha", tag.GitlabTip)
-		}
-	}
-	if len(tagRefSpecs) == 0 {
-		logger.Debug("no tags to push to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-	} else if err = p.repo.PushContext(ctx, &git.PushOptions{
-		RemoteName: "github",
-		Force:      true,
-		RefSpecs:   tagRefSpecs,
-	}); err != nil {
-		if errors.Is(err, git.NoErrAlreadyUpToDate) {
-			logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-		} else {
-			return fmt.Errorf("pushing to github repo: %v", err)
-		}
 	}
 
 	logger.Debug("setting default repository branch", "owner", p.githubPath[0], "repo", p.githubPath[1], "branch_name", p.defaultBranch)
