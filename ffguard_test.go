@@ -64,6 +64,9 @@ func TestIsFastForward(t *testing.T) {
 	// A commit that only GitHub has: it is not in this repository's objects.
 	githubOnly := guardTestCommit(t, newGuardTestRepo(t), "merged on GitHub", next)
 
+	// A tag object is no commit; a branch can point at one.
+	tagObject := guardTestTag(t, repo, "v1", next)
+
 	tests := []struct {
 		name      string
 		githubTip plumbing.Hash
@@ -75,6 +78,8 @@ func TestIsFastForward(t *testing.T) {
 		{"GitHub ahead of GitLab", next, base, false},
 		{"GitHub tip unknown to GitLab", githubOnly, next, false},
 		{"diverged, both known", side, next, false},
+		{"GitLab tip is a tag object", base, tagObject, false},
+		{"GitHub tip is a tag object", tagObject, next, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

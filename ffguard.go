@@ -23,7 +23,9 @@ type divergedRef struct {
 
 // isFastForward reports whether moving a branch from githubTip to gitlabTip
 // only adds commits. A githubTip that is not among the objects fetched from
-// GitLab is a commit GitLab does not have, so the move would drop it.
+// GitLab is a commit GitLab does not have, so the move would drop it. A tip
+// that is not a commit, such as a branch that points at a tag object, is not a
+// fast-forward either: the branch is left alone instead of failing the project.
 func isFastForward(repo *git.Repository, githubTip, gitlabTip plumbing.Hash) (bool, error) {
 	if githubTip == gitlabTip {
 		return true, nil
@@ -38,6 +40,11 @@ func isFastForward(repo *git.Repository, githubTip, gitlabTip plumbing.Hash) (bo
 	}
 
 	gitlabCommit, err := repo.CommitObject(gitlabTip)
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
+		// The object came with the clone, so it is not a commit: a branch that points
+		// at a tag object. Nothing tells that moving to it only adds commits.
+		return false, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("reading commit %s: %v", gitlabTip, err)
 	}
