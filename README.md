@@ -65,8 +65,8 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
         disable the live progress bars (they are also disabled when stderr is not a terminal)
   -no-prompt
         skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs
-  -overwrite-diverged-branches
-        when true, force-push every GitLab branch and tag even when the branch on GitHub has commits that GitLab lacks or the tag points elsewhere; by default those are left untouched on GitHub and a warning is logged
+  -overwrite-diverged-refs
+        when true, force-push every GitLab branch and tag even when a branch on GitHub has commits that GitLab lacks or a tag points elsewhere; by default those are left untouched on GitHub and a warning is logged
   -projects-csv string
         specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)
   -rename-master-to-main

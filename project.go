@@ -256,16 +256,16 @@ func (p *project) migrate(ctx context.Context) (err error) {
 	// requests were merged there, holds commits GitLab does not have. Force-pushing the
 	// GitLab tip would drop them, so such branches are left as they are on GitHub.
 	var githubTips map[string]plumbing.Hash
-	if !overwriteDivergedBranches {
+	if !overwriteDivergedRefs {
 		if githubTips, err = githubRefTips(ctx, p.repo); err != nil {
 			return err
 		}
-		var diverged []divergedBranch
+		var diverged []divergedRef
 		if refSpecs, diverged, err = splitDiverged(p.repo, refSpecs, githubTips); err != nil {
 			return fmt.Errorf("comparing branches with github repo: %v", err)
 		}
 		for _, branch := range diverged {
-			logger.Warn("branch has commits on GitHub that GitLab lacks, not overwriting it (pass -overwrite-diverged-branches to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip, "gitlab_sha", branch.GitlabTip)
+			logger.Warn("branch has commits on GitHub that GitLab lacks, not overwriting it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip, "gitlab_sha", branch.GitlabTip)
 		}
 	}
 
@@ -340,7 +340,7 @@ func (p *project) migrate(ctx context.Context) (err error) {
 	logger.Debug("force-pushing tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
 	p.bar.setPhase("pushing tags", 0)
 	tagRefSpecs := []config.RefSpec{"refs/tags/*:refs/tags/*"}
-	if !overwriteDivergedBranches {
+	if !overwriteDivergedRefs {
 		// A tag that points at another object on GitHub is left alone, like a diverged branch.
 		tagIter, err := p.repo.Tags()
 		if err != nil {
@@ -353,10 +353,10 @@ func (p *project) migrate(ctx context.Context) (err error) {
 		}); err != nil {
 			return fmt.Errorf("parsing tags: %v", err)
 		}
-		var moved []divergedBranch
+		var moved []divergedRef
 		tagRefSpecs, moved = splitMovedTags(tags, githubTips)
 		for _, tag := range moved {
-			logger.Warn("tag points at another object on GitHub, not overwriting it (pass -overwrite-diverged-branches to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "tag", tag.Name, "github_sha", tag.GithubTip, "gitlab_sha", tag.GitlabTip)
+			logger.Warn("tag points at another object on GitHub, not overwriting it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "tag", tag.Name, "github_sha", tag.GithubTip, "gitlab_sha", tag.GitlabTip)
 		}
 	}
 	if len(tagRefSpecs) == 0 {

@@ -127,7 +127,7 @@ func TestSplitDiverged(t *testing.T) {
 		t.Errorf("push = %v, want %v", push, wantPush)
 	}
 
-	wantDiverged := []divergedBranch{{Name: "main", GithubTip: githubOnly, GitlabTip: next}}
+	wantDiverged := []divergedRef{{Name: "main", GithubTip: githubOnly, GitlabTip: next}}
 	if !reflect.DeepEqual(diverged, wantDiverged) {
 		t.Errorf("diverged = %v, want %v", diverged, wantDiverged)
 	}
@@ -175,7 +175,7 @@ func TestSplitMovedTags(t *testing.T) {
 		t.Errorf("push = %v, want %v", push, wantPush)
 	}
 
-	wantMoved := []divergedBranch{{Name: "1.2.0", GithubTip: next, GitlabTip: base}}
+	wantMoved := []divergedRef{{Name: "1.2.0", GithubTip: next, GitlabTip: base}}
 	if !reflect.DeepEqual(moved, wantMoved) {
 		t.Errorf("moved = %v, want %v", moved, wantMoved)
 	}

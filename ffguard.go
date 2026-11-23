@@ -11,10 +11,11 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 )
 
-// divergedBranch is a branch whose tip on GitHub holds commits that the same
-// branch on GitLab does not have, for example pull requests merged on GitHub
-// after the first migration.
-type divergedBranch struct {
+// divergedRef is a branch or tag that is left alone on GitHub. A branch tip on
+// GitHub holds commits that the same branch on GitLab does not have, for
+// example pull requests merged on GitHub after the first migration. A tag
+// points at another object on GitHub than on GitLab. Name is the short name.
+type divergedRef struct {
 	Name      string
 	GithubTip plumbing.Hash
 	GitlabTip plumbing.Hash
@@ -48,9 +49,9 @@ func isFastForward(repo *git.Repository, githubTip, gitlabTip plumbing.Hash) (bo
 // without dropping commits from those that cannot. githubTips maps full
 // reference names (refs/heads/...) to the current tips on GitHub; a branch
 // that is not in it does not exist on GitHub yet and is pushed.
-func splitDiverged(repo *git.Repository, refSpecs []config.RefSpec, githubTips map[string]plumbing.Hash) ([]config.RefSpec, []divergedBranch, error) {
+func splitDiverged(repo *git.Repository, refSpecs []config.RefSpec, githubTips map[string]plumbing.Hash) ([]config.RefSpec, []divergedRef, error) {
 	push := make([]config.RefSpec, 0, len(refSpecs))
-	var diverged []divergedBranch
+	var diverged []divergedRef
 
 	for _, rs := range refSpecs {
 		githubTip, onGithub := githubTips[rs.Dst(plumbing.ReferenceName(rs.Src())).String()]
@@ -73,7 +74,7 @@ func splitDiverged(repo *git.Repository, refSpecs []config.RefSpec, githubTips m
 			continue
 		}
 
-		diverged = append(diverged, divergedBranch{
+		diverged = append(diverged, divergedRef{
 			Name:      plumbing.ReferenceName(rs.Src()).Short(),
 			GithubTip: githubTip,
 			GitlabTip: ref.Hash(),
@@ -87,14 +88,14 @@ func splitDiverged(repo *git.Repository, refSpecs []config.RefSpec, githubTips m
 // that already exist there on another object, for example a tag that was
 // re-created on GitHub and has a release. githubTips maps full reference names
 // (refs/tags/...) to the objects the tags point at on GitHub.
-func splitMovedTags(tags []*plumbing.Reference, githubTips map[string]plumbing.Hash) ([]config.RefSpec, []divergedBranch) {
+func splitMovedTags(tags []*plumbing.Reference, githubTips map[string]plumbing.Hash) ([]config.RefSpec, []divergedRef) {
 	push := make([]config.RefSpec, 0, len(tags))
-	var moved []divergedBranch
+	var moved []divergedRef
 
 	for _, tag := range tags {
 		githubTip, onGithub := githubTips[tag.Name().String()]
 		if onGithub && githubTip != tag.Hash() {
-			moved = append(moved, divergedBranch{Name: tag.Name().Short(), GithubTip: githubTip, GitlabTip: tag.Hash()})
+			moved = append(moved, divergedRef{Name: tag.Name().Short(), GithubTip: githubTip, GitlabTip: tag.Hash()})
 			continue
 		}
 		push = append(push, config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", tag.Name())))
