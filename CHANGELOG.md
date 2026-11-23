@@ -1,5 +1,12 @@
 ## Changelog
 
+### Unreleased
+
+- A rerun no longer overwrites what has changed on GitHub: a branch is pushed only when it is new on GitHub or its tip there is the GitLab tip or an ancestor of it, a tag only when it is new or points at the same object. Other branches and tags are left as they are and logged as warnings, with one summary at the end of the project and a warning on open merge requests that use a skipped branch. Skipped refs do not change the exit status
+- Add `-overwrite-diverged-refs` to restore the previous behaviour of force-pushing every branch and tag
+- `-trim-branches-on-github` no longer deletes a branch on GitHub whose tip is a commit that GitLab does not have, unless `-overwrite-diverged-refs` is set, and no longer force-pushes all branches when there is nothing to delete
+- Trimming uses the complete list of branches on GitHub instead of the first page of the REST listing
+
 ### v0.9.0
 
 - Update `github.com/google/go-github` to v74

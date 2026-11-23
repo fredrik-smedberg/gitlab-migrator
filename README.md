@@ -176,7 +176,16 @@ The tool maintains a thread-safe in-memory cache for certain primitives, in orde
 
 This tool tries to be idempotent. You can run it over and over and it will patch the GitHub repository, along with its pull requests, to match what you have in GitLab. This should help you migrate a number of projects without enacting a large maintenance window.
 
-_Note that this tool performs a forced mirror push, so it's not recommended to run this tool after commencing work in the target repository._
+A rerun never removes commits from GitHub that GitLab does not have:
+
+- A branch is pushed only when it is new on GitHub or its tip on GitHub is the GitLab tip or an ancestor of it. Otherwise, for example for `main` after pull requests were merged on GitHub, it is left as it is and logged as a warning.
+- A tag is pushed only when it is new on GitHub or points at the same object. A tag that is annotated on one side and lightweight on the other is a different object.
+- A branch or tag whose tip is not a commit that GitLab can compare is left alone as well.
+- `-trim-branches-on-github` keeps a branch that GitLab does not have if its tip is a commit GitLab does not have, for example a pull request branch created on GitHub.
+- At the end of a project one warning lists the skipped branches and tags, and each open merge request that uses a skipped branch gets a warning, as its pull request refers to the branch as it is on GitHub. Skipped refs are not errors and do not change the exit status.
+- `-overwrite-diverged-refs` restores the forced mirror push: every branch and tag is overwritten and every branch missing in GitLab is trimmed.
+
+The guard decides on a listing of the refs on GitHub and pushes without force, so git compares again against the refs that GitHub advertises for the push itself. A branch or tag that changed on GitHub in between is skipped with the same warning. What remains is the time between that check and the update on the server, which the server checks against the old value as well, so a ref that moves in that moment is reported as rejected by GitHub. With `-overwrite-diverged-refs` there is no such protection.
 
 For pull requests and their comments, the corresponding IDs from GitLab are added to the Markdown header, this is parsed to enable idempotence (see next section).
 
