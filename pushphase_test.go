@@ -125,15 +125,6 @@ func assertRemote(t *testing.T, path string, want map[string]plumbing.Hash) {
 	}
 }
 
-func names(refs []divergedRef) []string {
-	out := make([]string, 0, len(refs))
-	for _, r := range refs {
-		out = append(out, r.Name)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func TestGithubRefTipsEmptyRemote(t *testing.T) {
 	path := newBareRemote(t)
 	repo := newGitlabClone(t, path, func(*git.Repository) {})
@@ -215,7 +206,7 @@ func TestPushToGithubTrimWithNothingToDeletePushesNothing(t *testing.T) {
 	}
 	// main is skipped by the guard and trimming must not force-push it behind its back.
 	assertRemote(t, path, map[string]plumbing.Hash{"refs/heads/main": githubOnly, "refs/heads/feature": base})
-	if got := names(result.SkippedBranches); !reflect.DeepEqual(got, []string{"main"}) {
+	if got := skippedRefNames(result.SkippedBranches); !reflect.DeepEqual(got, []string{"main"}) {
 		t.Errorf("skipped branches = %v, want [main]", got)
 	}
 	if len(result.Trimmed) != 0 {
@@ -249,7 +240,7 @@ func TestPushToGithubTrimKeepsWorkThatExistsOnlyOnGithub(t *testing.T) {
 			t.Fatalf("pushToGithub: %v", err)
 		}
 		assertRemote(t, path, map[string]plumbing.Hash{"refs/heads/main": next, "refs/heads/pr-branch": githubOnly})
-		if got := names(result.KeptBranches); !reflect.DeepEqual(got, []string{"pr-branch"}) {
+		if got := skippedRefNames(result.KeptBranches); !reflect.DeepEqual(got, []string{"pr-branch"}) {
 			t.Errorf("kept = %v, want [pr-branch]", got)
 		}
 		if !reflect.DeepEqual(result.Trimmed, []string{"old-branch"}) {
@@ -321,7 +312,7 @@ func TestPushToGithubOverwriteFlag(t *testing.T) {
 			t.Fatalf("pushToGithub: %v", err)
 		}
 		assertRemote(t, path, map[string]plumbing.Hash{"refs/heads/main": githubOnly, "refs/tags/v1": githubOnly})
-		if !reflect.DeepEqual(names(result.SkippedBranches), []string{"main"}) || !reflect.DeepEqual(names(result.SkippedTags), []string{"v1"}) {
+		if !reflect.DeepEqual(skippedRefNames(result.SkippedBranches), []string{"main"}) || !reflect.DeepEqual(skippedRefNames(result.SkippedTags), []string{"v1"}) {
 			t.Errorf("skipped = %v, %v; want main and v1", result.SkippedBranches, result.SkippedTags)
 		}
 	})
@@ -507,7 +498,7 @@ func TestPushToGithubBranchMovedAfterListing(t *testing.T) {
 		t.Fatalf("pushToGithub: %v", err)
 	}
 	assertRemote(t, path, map[string]plumbing.Hash{"refs/heads/main": githubOnly, "refs/heads/feature": next})
-	if got := names(result.SkippedBranches); !reflect.DeepEqual(got, []string{"main"}) {
+	if got := skippedRefNames(result.SkippedBranches); !reflect.DeepEqual(got, []string{"main"}) {
 		t.Errorf("skipped branches = %v, want [main]", got)
 	}
 }
@@ -560,7 +551,7 @@ func TestPushToGithubTagCreatedAfterListing(t *testing.T) {
 			if refs["refs/tags/v2"] != other {
 				t.Errorf("v2 on remote = %s, want %s: the other tags are still pushed", refs["refs/tags/v2"], other)
 			}
-			if got := names(result.SkippedTags); !reflect.DeepEqual(got, []string{"v1"}) {
+			if got := skippedRefNames(result.SkippedTags); !reflect.DeepEqual(got, []string{"v1"}) {
 				t.Errorf("skipped tags = %v, want [v1]", got)
 			}
 		})
@@ -603,10 +594,42 @@ func TestPushToGithubBranchAtTagObjectIsSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pushToGithub: %v", err)
 	}
-	if got := names(result.SkippedBranches); !reflect.DeepEqual(got, []string{"other"}) {
+	if got := skippedRefNames(result.SkippedBranches); !reflect.DeepEqual(got, []string{"other"}) {
 		t.Errorf("skipped branches = %v, want [other]", got)
 	}
 	if got := remoteRefs(t, path)["refs/heads/other"]; got != base {
 		t.Errorf("other on remote = %s, want it untouched at %s", got, base)
+	}
+}
+
+func TestSkippedRefNames(t *testing.T) {
+	refs := []divergedRef{{Name: "release"}, {Name: "main"}}
+	if got, want := skippedRefNames(refs), []string{"main", "release"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("skippedRefNames = %v, want %v", got, want)
+	}
+	if got := skippedRefNames(nil); len(got) != 0 {
+		t.Errorf("skippedRefNames(nil) = %v, want none", got)
+	}
+}
+
+func TestSkippedBranchesOfMergeRequest(t *testing.T) {
+	p := &project{skippedBranches: map[string]bool{"main": true, "old": true}}
+	tests := []struct {
+		source, target string
+		want           []string
+	}{
+		{"feature", "develop", nil},
+		{"feature", "main", []string{"main"}},
+		{"old", "develop", []string{"old"}},
+		{"old", "main", []string{"old", "main"}},
+		{"main", "main", []string{"main"}},
+	}
+	for _, tt := range tests {
+		if got := p.skippedBranchesOf(tt.source, tt.target); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("skippedBranchesOf(%q, %q) = %v, want %v", tt.source, tt.target, got, tt.want)
+		}
+	}
+	if got := (&project{}).skippedBranchesOf("main", "main"); got != nil {
+		t.Errorf("without skipped branches got %v, want nil", got)
 	}
 }

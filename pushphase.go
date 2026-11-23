@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 
@@ -274,4 +275,26 @@ func renameTrunkRef(repo *git.Repository, from, to string) error {
 		return fmt.Errorf("deleting old trunk branch: %v", err)
 	}
 	return nil
+}
+
+// skippedRefNames returns the sorted names of refs.
+func skippedRefNames(refs []divergedRef) []string {
+	names := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		names = append(names, ref.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// skippedBranchesOf returns those of the source and target branch of a merge
+// request that were not pushed to GitHub, without duplicates.
+func (p *project) skippedBranchesOf(source, target string) []string {
+	var skipped []string
+	for _, branch := range []string{source, target} {
+		if p.skippedBranches[branch] && !slices.Contains(skipped, branch) {
+			skipped = append(skipped, branch)
+		}
+	}
+	return skipped
 }

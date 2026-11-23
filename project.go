@@ -103,6 +103,10 @@ type project struct {
 	// rejectedBranches holds branch names GitHub refused to accept (for example GH001,
 	// a file over 100 MB). Written before the merge request phases, read by the workers.
 	rejectedBranches map[string]bool
+
+	// skippedBranches holds the branches that were left as they are on GitHub because they have
+	// commits there that GitLab lacks. Written before the merge request phases, read by the workers.
+	skippedBranches map[string]bool
 }
 
 func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted bool) error {
@@ -244,6 +248,14 @@ func (p *project) migrate(ctx context.Context) (err error) {
 	}
 	for _, branch := range result.KeptBranches {
 		logger.Warn("branch exists only on GitHub, not trimming it (pass -overwrite-diverged-refs to force)", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branch.Name, "github_sha", branch.GithubTip)
+	}
+	p.skippedBranches = make(map[string]bool, len(result.SkippedBranches))
+	for _, branch := range result.SkippedBranches {
+		p.skippedBranches[branch.Name] = true
+	}
+	if len(result.SkippedBranches)+len(result.SkippedTags) > 0 {
+		// Not an error: a default branch that is ahead of GitLab after the cutover is skipped on every run.
+		logger.Warn("branches and tags were left as they are on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "skipped_branches", len(result.SkippedBranches), "branches", skippedRefNames(result.SkippedBranches), "skipped_tags", len(result.SkippedTags), "tags", skippedRefNames(result.SkippedTags))
 	}
 	if len(result.Rejected) > 0 {
 		names := make([]string, 0, len(result.Rejected))
@@ -723,6 +735,16 @@ func (p *project) prepareMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	if p.defaultBranch != p.project.DefaultBranch && w.targetRef == p.project.DefaultBranch {
 		logger.Trace("changing target trunk branch", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "old_trunk", p.project.DefaultBranch, "new_trunk", p.defaultBranch)
 		w.targetRef = p.defaultBranch
+	}
+
+	if strings.EqualFold(mergeRequest.State, "opened") {
+		sourceRef := mergeRequest.SourceBranch
+		if p.defaultBranch != p.project.DefaultBranch && sourceRef == p.project.DefaultBranch {
+			sourceRef = p.defaultBranch
+		}
+		if skipped := p.skippedBranchesOf(sourceRef, w.targetRef); len(skipped) > 0 {
+			logger.Warn("merge request uses a branch that was not pushed from GitLab, so its pull request refers to the branch as it is on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "branches", skipped)
+		}
 	}
 
 	w.author = mergeRequest.Author.Name
