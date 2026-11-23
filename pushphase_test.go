@@ -474,3 +474,139 @@ func TestPushToGithubTags(t *testing.T) {
 		})
 	}
 }
+
+// moveRemote runs change on the bare repository at path, through a scratch
+// repository that fetches nothing: change builds the new state and pushes it.
+func moveRemote(t *testing.T, path string, change func(repo *git.Repository)) {
+	t.Helper()
+	seedRemote(t, path, change)
+}
+
+func TestPushToGithubBranchMovedAfterListing(t *testing.T) {
+	path := newBareRemote(t)
+	var base, next, githubOnly plumbing.Hash
+	seedRemote(t, path, func(repo *git.Repository) {
+		base, next = history(t, repo)
+		guardTestBranch(t, repo, "main", base)
+		guardTestBranch(t, repo, "feature", base)
+	})
+	repo := newGitlabClone(t, path, func(repo *git.Repository) {
+		history(t, repo)
+		guardTestBranch(t, repo, "main", next)
+		guardTestBranch(t, repo, "feature", next)
+	})
+
+	// The guard sees main on base, a fast-forward. Then a pull request is merged on GitHub.
+	result, err := pushToGithub(context.Background(), repo, pushOptions{afterListing: func() {
+		moveRemote(t, path, func(r *git.Repository) {
+			githubOnly = guardTestCommit(t, r, "merged on github", guardTestCommit(t, r, "base"))
+			guardTestBranch(t, r, "main", githubOnly)
+		})
+	}})
+	if err != nil {
+		t.Fatalf("pushToGithub: %v", err)
+	}
+	assertRemote(t, path, map[string]plumbing.Hash{"refs/heads/main": githubOnly, "refs/heads/feature": next})
+	if got := names(result.SkippedBranches); !reflect.DeepEqual(got, []string{"main"}) {
+		t.Errorf("skipped branches = %v, want [main]", got)
+	}
+}
+
+func TestPushToGithubTagCreatedAfterListing(t *testing.T) {
+	for _, tc := range []struct{ github, gitlab string }{
+		{"lightweight", "lightweight"},
+		{"annotated", "lightweight"},
+		{"lightweight", "annotated"},
+		{"annotated", "annotated"},
+	} {
+		annotated := tc.github == "annotated"
+		t.Run("created "+tc.github+" on GitHub, "+tc.gitlab+" on GitLab", func(t *testing.T) {
+			path := newBareRemote(t)
+			var base, githubTag, other plumbing.Hash
+			seedRemote(t, path, func(repo *git.Repository) {
+				base = guardTestCommit(t, repo, "base")
+				guardTestBranch(t, repo, "main", base)
+			})
+			repo := newGitlabClone(t, path, func(repo *git.Repository) {
+				guardTestCommit(t, repo, "base")
+				guardTestBranch(t, repo, "main", base)
+				if tc.gitlab == "annotated" {
+					guardTestTag(t, repo, "v1", base)
+				} else {
+					guardTestRef(t, repo, plumbing.NewTagReferenceName("v1"), base)
+				}
+				other = guardTestTag(t, repo, "v2", base)
+			})
+
+			result, err := pushToGithub(context.Background(), repo, pushOptions{afterListing: func() {
+				moveRemote(t, path, func(r *git.Repository) {
+					guardTestCommit(t, r, "base")
+					second := guardTestCommit(t, r, "second", base)
+					githubTag = second
+					if annotated {
+						githubTag = guardTestTag(t, r, "v1", second)
+					} else {
+						guardTestRef(t, r, plumbing.NewTagReferenceName("v1"), second)
+					}
+				})
+			}})
+			if err != nil {
+				t.Fatalf("pushToGithub: %v", err)
+			}
+			refs := remoteRefs(t, path)
+			if refs["refs/tags/v1"] != githubTag {
+				t.Errorf("v1 on remote = %s, want %s, the tag created on GitHub", refs["refs/tags/v1"], githubTag)
+			}
+			if refs["refs/tags/v2"] != other {
+				t.Errorf("v2 on remote = %s, want %s: the other tags are still pushed", refs["refs/tags/v2"], other)
+			}
+			if got := names(result.SkippedTags); !reflect.DeepEqual(got, []string{"v1"}) {
+				t.Errorf("skipped tags = %v, want [v1]", got)
+			}
+		})
+	}
+}
+
+func TestPushToGithubOverwriteIgnoresMovedRemote(t *testing.T) {
+	path := newBareRemote(t)
+	var base, next plumbing.Hash
+	seedRemote(t, path, func(repo *git.Repository) {
+		base, next = history(t, repo)
+		guardTestBranch(t, repo, "main", base)
+	})
+	repo := newGitlabClone(t, path, func(repo *git.Repository) {
+		history(t, repo)
+		guardTestBranch(t, repo, "main", next)
+	})
+	if _, err := pushToGithub(context.Background(), repo, pushOptions{overwrite: true}); err != nil {
+		t.Fatalf("pushToGithub: %v", err)
+	}
+	assertRemote(t, path, map[string]plumbing.Hash{"refs/heads/main": next})
+}
+
+func TestPushToGithubBranchAtTagObjectIsSkipped(t *testing.T) {
+	path := newBareRemote(t)
+	var base plumbing.Hash
+	seedRemote(t, path, func(repo *git.Repository) {
+		base = guardTestCommit(t, repo, "base")
+		guardTestBranch(t, repo, "main", base)
+		guardTestBranch(t, repo, "other", base)
+	})
+	repo := newGitlabClone(t, path, func(repo *git.Repository) {
+		next := guardTestCommit(t, repo, "next", guardTestCommit(t, repo, "base"))
+		guardTestBranch(t, repo, "main", next)
+		// A branch that points at a tag object, not at a commit.
+		guardTestBranch(t, repo, "other", guardTestTag(t, repo, "t", next))
+	})
+
+	result, err := pushToGithub(context.Background(), repo, pushOptions{})
+	if err != nil {
+		t.Fatalf("pushToGithub: %v", err)
+	}
+	if got := names(result.SkippedBranches); !reflect.DeepEqual(got, []string{"other"}) {
+		t.Errorf("skipped branches = %v, want [other]", got)
+	}
+	if got := remoteRefs(t, path)["refs/heads/other"]; got != base {
+		t.Errorf("other on remote = %s, want it untouched at %s", got, base)
+	}
+}

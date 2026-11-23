@@ -16,6 +16,12 @@ import (
 // It returns the rejected refspecs. Errors that are not per-ref rejections,
 // such as network errors, are returned as they are.
 func isolateRejected(refSpecs []config.RefSpec, push func([]config.RefSpec) error) ([]config.RefSpec, error) {
+	return isolateRejectedBy(refSpecs, push, isRefRejection)
+}
+
+// isolateRejectedBy is isolateRejected with its own idea of which errors reject
+// refs: those for which isRejection returns true.
+func isolateRejectedBy(refSpecs []config.RefSpec, push func([]config.RefSpec) error, isRejection func(error) bool) ([]config.RefSpec, error) {
 	if len(refSpecs) == 0 {
 		return nil, nil
 	}
@@ -23,7 +29,7 @@ func isolateRejected(refSpecs []config.RefSpec, push func([]config.RefSpec) erro
 	if err == nil {
 		return nil, nil
 	}
-	if !isRefRejection(err) {
+	if !isRejection(err) {
 		return nil, err
 	}
 	if len(refSpecs) == 1 {
@@ -33,7 +39,7 @@ func isolateRejected(refSpecs []config.RefSpec, push func([]config.RefSpec) erro
 	mid := len(refSpecs) / 2
 	var rejected []config.RefSpec
 	for _, half := range [][]config.RefSpec{refSpecs[:mid], refSpecs[mid:]} {
-		r, err := isolateRejected(half, push)
+		r, err := isolateRejectedBy(half, push, isRejection)
 		if err != nil {
 			return rejected, err
 		}
